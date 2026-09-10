@@ -15,6 +15,15 @@ ADDITIONAL_CONFIG_ENV = "UCM_MODEL_CHECK_ADDITIONAL_CONFIG"
 STORE_PIPELINE_ENV = "UCM_MODEL_CHECK_STORE_PIPELINE"
 STORAGE_BACKENDS_ENV = "UCM_MODEL_CHECK_STORAGE_BACKENDS"
 DEVICE_ENV = "UCM_MODEL_CHECK_DEVICE_ID"
+DEVICES_ENV = "UCM_MODEL_CHECK_DEVICES"
+TENSOR_PARALLEL_SIZE_ENV = "UCM_MODEL_CHECK_TENSOR_PARALLEL_SIZE"
+PLATFORM_ENV = "UCM_MODEL_CHECK_PLATFORM"
+MASTER_ADDR_ENV = "UCM_MODEL_CHECK_MASTER_ADDR"
+MASTER_PORT_ENV = "UCM_MODEL_CHECK_MASTER_PORT"
+RANK_ENV = "UCM_MODEL_CHECK_RANK"
+WORLD_SIZE_ENV = "UCM_MODEL_CHECK_WORLD_SIZE"
+LOCAL_RANK_ENV = "UCM_MODEL_CHECK_LOCAL_RANK"
+PHYSICAL_DEVICE_ENV = "UCM_MODEL_CHECK_PHYSICAL_DEVICE"
 DTYPE_ENV = "UCM_MODEL_CHECK_DTYPE"
 KV_CACHE_DTYPE_ENV = "UCM_MODEL_CHECK_KV_CACHE_DTYPE"
 CONNECTOR_MODULE_PATH_ENV = "UCM_MODEL_CHECK_CONNECTOR_MODULE_PATH"
@@ -68,6 +77,11 @@ class ModelCheckConfig:
     store_pipeline: str
     storage_backends: str
     visible_devices: str
+    devices: str
+    tensor_parallel_size: int
+    platform: str
+    master_addr: str
+    master_port: int
     dtype: str
     kv_cache_dtype: str
     connector_module_path: str
@@ -75,6 +89,8 @@ class ModelCheckConfig:
 
 def load_config() -> ModelCheckConfig:
     """Load model-check configuration from the child-process environment."""
+    visible_devices = os.environ.get(DEVICE_ENV, "0")
+    devices = os.environ.get(DEVICES_ENV, visible_devices)
     return ModelCheckConfig(
         model=os.environ.get(MODEL_ENV, "/models/Qwen2.5-14B-Instruct"),
         tokens=_int_env(TOKENS_ENV, 4096),
@@ -83,7 +99,12 @@ def load_config() -> ModelCheckConfig:
         additional_config=_dict_env(ADDITIONAL_CONFIG_ENV),
         store_pipeline=os.environ.get(STORE_PIPELINE_ENV, "Cache|Posix"),
         storage_backends=os.environ.get(STORAGE_BACKENDS_ENV, "./build/data"),
-        visible_devices=os.environ.get(DEVICE_ENV, "0"),
+        visible_devices=visible_devices,
+        devices=devices,
+        tensor_parallel_size=_int_env(TENSOR_PARALLEL_SIZE_ENV, 1),
+        platform=os.environ.get(PLATFORM_ENV, "auto"),
+        master_addr=os.environ.get(MASTER_ADDR_ENV, "127.0.0.1"),
+        master_port=_int_env(MASTER_PORT_ENV, 0),
         dtype=os.environ.get(DTYPE_ENV, "auto"),
         kv_cache_dtype=os.environ.get(KV_CACHE_DTYPE_ENV, "auto"),
         connector_module_path=os.environ.get(

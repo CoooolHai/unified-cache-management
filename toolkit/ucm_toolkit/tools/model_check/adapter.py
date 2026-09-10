@@ -16,6 +16,7 @@ from .config import (
     BLOCK_SIZE_ENV,
     CONNECTOR_MODULE_PATH_ENV,
     DEVICE_ENV,
+    DEVICES_ENV,
     DTYPE_ENV,
     KV_CACHE_DTYPE_ENV,
     LEGACY_CONNECTOR_MODULE,
@@ -23,8 +24,13 @@ from .config import (
     STORAGE_BACKENDS_ENV,
     STORE_PIPELINE_ENV,
     TOKENS_ENV,
+    TENSOR_PARALLEL_SIZE_ENV,
+    PLATFORM_ENV,
+    MASTER_ADDR_ENV,
+    MASTER_PORT_ENV,
     USE_LAYERWISE_ENV,
 )
+from .topology import make_topology
 
 
 def _json_object(value: str) -> dict[str, object]:
@@ -95,14 +101,32 @@ class ModelCheckTool(ToolAdapter):
         )
         parser.add_argument(
             "--device-id",
-            default="0",
+            default=None,
             help="physical accelerator id exposed to the checker process",
         )
+        parser.add_argument(
+            "--devices",
+            help="comma-separated physical accelerator ids for TP workers",
+        )
+        parser.add_argument(
+            "--tensor-parallel-size",
+            type=int,
+            default=None,
+            help="number of tensor-parallel workers (single-node TP)",
+        )
+        parser.add_argument(
+            "--platform",
+            choices=("auto", "cuda", "ascend", "cpu"),
+            default=None,
+            help="serving platform; auto detects the installed stack",
+        )
+        parser.add_argument("--master-addr", default=None)
+        parser.add_argument("--master-port", type=int, default=None)
         parser.add_argument("--dtype", help="vLLM model dtype")
         parser.add_argument("--kv-cache-dtype", help="vLLM KV-cache dtype")
         parser.add_argument(
             "--connector-module-path",
-            default=LEGACY_CONNECTOR_MODULE,
+            default=None,
             help="module containing the UCMConnector facade",
         )
 
@@ -124,7 +148,41 @@ class ModelCheckTool(ToolAdapter):
             return 0 if exc.code is None else 1
 
         env = os.environ.copy()
-        platform = _detect_platform()
+        requested_platform = args.platform or env.get(PLATFORM_ENV, "auto")
+        if requested_platform not in ("auto", "cuda", "ascend", "cpu"):
+            raise ToolkitError(
+                "invalid model-check platform: "
+                f"{requested_platform!r}; expected auto/cuda/ascend/cpu"
+            )
+        platform = (
+            requested_platform
+            if requested_platform != "auto"
+            else _detect_platform()
+        )
+        try:
+            tp_size = args.tensor_parallel_size
+            if tp_size is None:
+                tp_size = int(env.get(TENSOR_PARALLEL_SIZE_ENV, "1"))
+            device_id = args.device_id or env.get(DEVICE_ENV, "0")
+            devices = args.devices or env.get(DEVICES_ENV) or device_id
+            requested_port = (
+                args.master_port
+                if args.master_port is not None
+                else int(env.get(MASTER_PORT_ENV, "0"))
+            )
+            # TP1 never initializes a process group in the controller.  Keep
+            # its legacy path socket-free; TP>1 resolves one ephemeral port.
+            if tp_size == 1 and requested_port == 0:
+                requested_port = 29500
+            topology = make_topology(
+                tp_size,
+                devices,
+                master_addr=args.master_addr
+                or env.get(MASTER_ADDR_ENV, "127.0.0.1"),
+                master_port=requested_port,
+            )
+        except ValueError as exc:
+            raise ToolkitError(f"invalid model-check TP topology: {exc}") from exc
         string_options = (
             ("model", MODEL_ENV),
             ("tokens", TOKENS_ENV),
@@ -142,12 +200,24 @@ class ModelCheckTool(ToolAdapter):
             env[ADDITIONAL_CONFIG_ENV] = json.dumps(args.additional_config)
         if args.layerwise is not None:
             env[USE_LAYERWISE_ENV] = str(args.layerwise).lower()
-        env[DEVICE_ENV] = args.device_id
-        env[CONNECTOR_MODULE_PATH_ENV] = args.connector_module_path
+        env[DEVICE_ENV] = device_id
+        connector_module_path = args.connector_module_path or env.get(
+            CONNECTOR_MODULE_PATH_ENV, LEGACY_CONNECTOR_MODULE
+        )
+        env[CONNECTOR_MODULE_PATH_ENV] = connector_module_path
+        if tp_size != 1 or args.devices is not None:
+            env[DEVICES_ENV] = topology.visible_devices
+            env[TENSOR_PARALLEL_SIZE_ENV] = str(tp_size)
+        if args.platform is not None:
+            env[PLATFORM_ENV] = args.platform
+        if tp_size != 1 or args.master_addr is not None:
+            env[MASTER_ADDR_ENV] = topology.master_addr
+        if tp_size != 1 or args.master_port is not None:
+            env[MASTER_PORT_ENV] = str(topology.rendezvous_port)
         if platform == "cuda":
-            env["CUDA_VISIBLE_DEVICES"] = args.device_id
+            env["CUDA_VISIBLE_DEVICES"] = topology.visible_devices
         elif platform == "ascend":
-            env["ASCEND_RT_VISIBLE_DEVICES"] = args.device_id
+            env["ASCEND_RT_VISIBLE_DEVICES"] = topology.visible_devices
         # cpu: no device-visibility variable needed
         module = f"{__package__}.{platform}"
         return run_command([sys.executable, "-m", module], env=env)

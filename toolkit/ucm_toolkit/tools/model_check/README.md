@@ -93,6 +93,10 @@ ucm-toolkit run model-check \
     --connector-module-path ucm.integration.vllm.v2.ucm_connector \
     --model /path/to/model --tokens 1024 --block-size 128 \
     --storage-backends /path/to/ucm_storage
+
+# Single-node TP layout check (physical ids map to logical worker ids)
+ucm-toolkit run model-check --platform cuda --tensor-parallel-size 4 \
+    --devices 0,2,4,6 --model /path/to/model
 ```
 
 `adapter.py` picks the launcher automatically: `vllm_ascend` installed →
@@ -110,10 +114,22 @@ layout.  The v2 check fills and compares
 each selected `(key, offset, ptr, size)` range with a position-dependent byte
 pattern; this catches sub-block offset errors that block-constant fills miss.
 
+TP workers construct the meta model and production runner on every rank,
+exchange `KVCacheSpec`, and invoke vLLM's native multi-worker KV-cache planner.
+TP>1 is currently layout-only: the existing single-Scheduler UCM metadata
+round-trip is retained for TP1, while TP>1 + connector-v2 fails fast until
+rank-aware metadata serialization is validated.
+
 Success looks like:
 
 ```
 [ucm-kv-check] PASS: Scheduler->UCM dump/load, compared_loaded_tensor_blocks=N
+```
+
+For TP>1 layout-only checks, every rank prints:
+
+```
+[ucm-kv-check] TP layout check passed for rank=R/N
 ```
 
 ## Known limitations (tested against vLLM 0.26.0 / vLLM-Ascend 0.26.0rc)
@@ -129,8 +145,9 @@ Success looks like:
   `hit external: 0` and `verify()` stops at "no load_block_ids" (dump side and
   layout printing are complete). Ascend hits `hit external` normally; CUDA is
   expected to behave like Ascend (to be confirmed on a GPU machine).
-- Distributed init uses a fixed TCP port (29500); run checkers serially to
-  avoid `EADDRINUSE`.
+- TP>1 uses one controller-selected rendezvous port and launches one worker per
+  requested physical device; the controller terminates remaining workers on
+  the first failure or timeout.
 - Prefix caching: the CPU platform forces it off for MLA models; keep it off
   (UCM takes over prefix lookup; local HBM hits would bypass the external load,
   which is why `cpu.py` leaves it disabled).

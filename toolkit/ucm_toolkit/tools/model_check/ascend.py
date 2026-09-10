@@ -51,11 +51,15 @@ import traceback
 from typing import Any
 
 import torch
+from .parallel import launch_workers
 from .config import load_config
+from .topology import make_topology
 from .common import (
     CacheFixture,
     UnsupportedEnvironment,
+    check_tensor_parallel_connector,
     current_vllm_config_context,
+    dist_barrier,
     log,
 )
 from .common import make_cache as make_common_cache
@@ -80,8 +84,15 @@ visible_devices = config.visible_devices
 dtype = config.dtype
 kv_cache_dtype = config.kv_cache_dtype
 connector_module_path = config.connector_module_path
+tensor_parallel_size = config.tensor_parallel_size
+devices = config.devices
+master_addr = config.master_addr
+master_port = config.master_port
 trust_remote_code = True
-request_token_salt = time.time_ns() ^ os.getpid()
+_default_request_token_salt = str(time.time_ns() ^ os.getpid())
+request_token_salt = int(
+    os.environ.get("UCM_MODEL_CHECK_REQUEST_TOKEN_SALT", _default_request_token_salt)
+)
 
 
 def _factory_kwargs_redirect_to_meta(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -119,6 +130,7 @@ def make_config() -> Any:
         use_layerwise,
         "npu",
         connector_module_path,
+        tensor_parallel_size,
     )
 
 
@@ -307,15 +319,26 @@ def patch_groups(fixture: CacheFixture) -> None:
 def check_config() -> None:
     if tokens <= 0 or block_size <= 0:
         raise ValueError("tokens and block_size must be positive")
+    check_tensor_parallel_connector(tensor_parallel_size, connector_module_path)
 
 
 def main() -> int:
     check_config()
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = visible_devices
-    active_device = torch.device("npu:0")
+    if tensor_parallel_size > 1 and "UCM_MODEL_CHECK_RANK" not in os.environ:
+        topology = make_topology(
+            tensor_parallel_size,
+            devices,
+            master_addr=master_addr,
+            master_port=master_port,
+        )
+        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = topology.visible_devices
+        return launch_workers(__name__, topology, os.environ.copy())
+    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = devices
+    local_rank = int(os.environ.get("UCM_MODEL_CHECK_LOCAL_RANK", "0"))
+    active_device = torch.device(f"npu:{local_rank}")
     importlib.import_module("torch_npu")
     torch.npu.set_device(active_device)
-    log(f"ASCEND_RT_VISIBLE_DEVICES={visible_devices}, device={active_device}")
+    log(f"ASCEND_RT_VISIBLE_DEVICES={devices}, device={active_device}")
     vllm_config = None
     fixture = None
     worker = None
@@ -326,6 +349,10 @@ def main() -> int:
         # UCM's MLA shared buffer is created by the worker.  The scheduler reads
         # the worker-published id, so initialize the worker before Scheduler.
         worker = make_worker(fixture)
+        if fixture.world_size > 1:
+            dist_barrier()
+            log(f"TP layout check passed for rank={fixture.rank}/{fixture.world_size}")
+            return 0
         torch.npu.set_device(active_device)
         dispatch = schedule(fixture, tokens, request_token_salt, patch_groups, worker)
         verify(fixture, dispatch, worker, torch.npu.synchronize)

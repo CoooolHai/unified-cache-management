@@ -76,6 +76,11 @@ class CacheFixture:
     kv_caches: dict[str, Any]
     layer_to_group: dict[str, int]
     transfer_layers: tuple[str, ...]
+    # All worker configs are retained on every rank so rank 0 can construct a
+    # scheduler view that exactly matches the distributed worker layout.
+    worker_kv_cache_configs: tuple[Any, ...] = ()
+    rank: int = 0
+    world_size: int = 1
 
 
 # Engine and UCM configuration.
@@ -126,8 +131,13 @@ def make_config(
     use_layerwise: bool,
     device: str,
     connector_module_path: str = "ucm.integration.vllm.ucm_connector",
+    tensor_parallel_size: int = 1,
 ) -> Any:
-    """Create a one-rank vLLM configuration for the synthetic request."""
+    """Create a vLLM configuration for the synthetic request.
+
+    The model-checker remains no-weight: TP only changes vLLM's model
+    partitioning and distributed process-group configuration.
+    """
 
     from vllm.config import KVTransferConfig
     from vllm.engine.arg_utils import EngineArgs
@@ -156,7 +166,7 @@ def make_config(
             "dtype": dtype,
             "kv_cache_dtype": kv_cache_dtype,
             "block_size": block_size,
-            "tensor_parallel_size": 1,
+            "tensor_parallel_size": tensor_parallel_size,
             "pipeline_parallel_size": 1,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": max_model_len,
@@ -388,12 +398,18 @@ def resolve_layout(vllm_config: Any, kv_cache_specs: dict[str, Any]) -> None:
         )
 
 
-def make_layout(
+def make_layouts(
     vllm_config: Any,
     kv_cache_specs: dict[str, Any],
     num_blocks: int,
-) -> Any:
-    """Use vLLM's own global grouping/config path; never reconstruct a group."""
+    worker_kv_cache_specs: list[dict[str, Any]] | None = None,
+) -> tuple[Any, ...]:
+    """Use vLLM's own global grouping/config path; never reconstruct a group.
+
+    With TP, ``worker_kv_cache_specs`` contains one production spec per rank.
+    vLLM then performs the same cross-worker grouping and capacity planning it
+    uses in EngineCore; this helper merely selects the config for this rank.
+    """
 
     import vllm.v1.core.kv_cache_utils as kv_utils
 
@@ -403,21 +419,31 @@ def make_layout(
     if hasattr(kv_utils, "get_kv_cache_configs"):
         with current_vllm_config_context(vllm_config):
             configs = kv_utils.get_kv_cache_configs(
-                vllm_config, [kv_cache_specs], [1 << 50]
+                vllm_config,
+                worker_kv_cache_specs or [kv_cache_specs],
+                [1 << 50] * len(worker_kv_cache_specs or [kv_cache_specs]),
             )
-        if len(configs) != 1:
+        if not configs:
             raise UnsupportedEnvironment(
-                f"Expected one worker KV config, got {len(configs)}"
+                "vLLM returned no worker KV configs"
             )
-        return configs[0]
+        return tuple(configs)
 
     if not hasattr(kv_utils, "get_kv_cache_groups"):
         raise UnsupportedEnvironment(
             "Installed vLLM exposes neither get_kv_cache_configs nor "
             "get_kv_cache_groups; exact native grouping cannot be guaranteed."
         )
+    if worker_kv_cache_specs and len(worker_kv_cache_specs) > 1:
+        raise UnsupportedEnvironment(
+            "This vLLM version cannot expose its multi-worker KV config API; "
+            "TP>1 requires get_kv_cache_configs()."
+        )
     with current_vllm_config_context(vllm_config):
-        groups = kv_utils.get_kv_cache_groups(vllm_config, kv_cache_specs)
+        groups = kv_utils.get_kv_cache_groups(
+            vllm_config,
+            kv_cache_specs,
+        )
     build_config = kv_utils.get_kv_cache_config_from_groups
     kwargs: dict[str, Any] = {
         "vllm_config": vllm_config,
@@ -427,7 +453,29 @@ def make_layout(
     if "kv_cache_specs" in inspect.signature(build_config).parameters:
         kwargs["kv_cache_specs"] = kv_cache_specs
     with current_vllm_config_context(vllm_config):
-        return build_config(**kwargs)
+        return (build_config(**kwargs),)
+
+
+def make_layout(
+    vllm_config: Any,
+    kv_cache_specs: dict[str, Any],
+    num_blocks: int,
+    worker_kv_cache_specs: list[dict[str, Any]] | None = None,
+    worker_index: int = 0,
+) -> Any:
+    """Select one config from the single production planner invocation."""
+
+    configs = make_layouts(
+        vllm_config,
+        kv_cache_specs,
+        num_blocks,
+        worker_kv_cache_specs,
+    )
+    if worker_index >= len(configs):
+        raise UnsupportedEnvironment(
+            f"Expected worker KV config for rank={worker_index}, got {len(configs)}"
+        )
+    return configs[worker_index]
 
 
 def plan_blocks(
@@ -435,6 +483,8 @@ def plan_blocks(
     kv_cache_specs: dict[str, Any],
     tokens: int,
     block_size: int,
+    worker_kv_cache_specs: list[dict[str, Any]] | None = None,
+    worker_index: int = 0,
 ) -> int:
     """Return three times the minimum pool accepted by this vLLM version."""
 
@@ -450,7 +500,13 @@ def plan_blocks(
 
         nonlocal last_capacity_error
         try:
-            make_layout(vllm_config, kv_cache_specs, num_blocks)
+            make_layout(
+                vllm_config,
+                kv_cache_specs,
+                num_blocks,
+                worker_kv_cache_specs,
+                worker_index,
+            )
         except ValueError as exc:
             message = str(exc).lower()
             capacity_error = "no available memory for the cache blocks" in message or (
@@ -572,8 +628,26 @@ def init_kv(
     return kv_caches
 
 
+def distributed_rank() -> tuple[int, int, int, str, int]:
+    """Read the launcher rank contract without importing vLLM."""
+
+    import os
+
+    def integer(name: str, default: int) -> int:
+        value = os.environ.get(name)
+        return default if value is None else int(value)
+
+    return (
+        integer("UCM_MODEL_CHECK_RANK", 0),
+        integer("UCM_MODEL_CHECK_WORLD_SIZE", 1),
+        integer("UCM_MODEL_CHECK_LOCAL_RANK", 0),
+        os.environ.get("UCM_MODEL_CHECK_MASTER_ADDR", "127.0.0.1"),
+        integer("UCM_MODEL_CHECK_MASTER_PORT", 29500),
+    )
+
+
 def init_dist(vllm_config: Any, backend: str) -> None:
-    """Create vLLM's mandatory one-rank model-parallel group once."""
+    """Create vLLM's model-parallel group for the configured TP workers."""
 
     from vllm.distributed import (
         init_distributed_environment,
@@ -581,18 +655,35 @@ def init_dist(vllm_config: Any, backend: str) -> None:
         model_parallel_is_initialized,
     )
 
+    rank, world_size, local_rank, master_addr, master_port = distributed_rank()
+    tp_size = int(
+        getattr(vllm_config.parallel_config, "tensor_parallel_size", world_size)
+    )
+    if world_size != tp_size:
+        raise UnsupportedEnvironment(
+            "model-check TP topology disagrees with vLLM config: "
+            f"launcher world_size={world_size}, tensor_parallel_size={tp_size}"
+        )
+    # UCM derives tp_rank from this field rather than torch.distributed's
+    # process-global rank.  Set it before model/runner/connector construction.
+    if hasattr(vllm_config, "parallel_config"):
+        vllm_config.parallel_config.rank = rank
+        if hasattr(vllm_config.parallel_config, "local_rank"):
+            vllm_config.parallel_config.local_rank = local_rank
     if not torch.distributed.is_initialized():
         with current_vllm_config_context(vllm_config):
             init_distributed_environment(
-                world_size=1,
-                rank=0,
-                distributed_init_method="tcp://127.0.0.1:29500",
-                local_rank=0,
+                world_size=world_size,
+                rank=rank,
+                distributed_init_method=(
+                    f"tcp://{master_addr}:{master_port}"
+                ),
+                local_rank=local_rank,
                 backend=backend,
             )
     if not model_parallel_is_initialized():
         with current_vllm_config_context(vllm_config):
-            initialize_model_parallel(1, 1, 1, 1, backend=backend)
+            initialize_model_parallel(tp_size, 1, 1, 1, backend=backend)
 
 
 def make_cache(
@@ -608,6 +699,7 @@ def make_cache(
     """Build the native KV layout, tensors, and layer-to-group mapping."""
 
     init_dist(vllm_config, backend)
+    rank, world_size, _local_rank, _master_addr, _master_port = distributed_rank()
     model, kv_vllm_config = make_model(vllm_config)
     runner = make_runner(kv_vllm_config, model, active_device)
 
@@ -626,17 +718,56 @@ def make_cache(
 
     resolve_layout(kv_vllm_config, kv_cache_specs)
 
+    # Specs are produced independently by the real ModelRunner on every rank,
+    # then gathered before any KVCacheConfig is planned.  This is the same
+    # producer/consumer split used by vLLM's distributed engine path and avoids
+    # silently accepting rank-local layouts.
+    worker_kv_cache_specs: list[dict[str, Any]] = [kv_cache_specs]
+    if world_size > 1:
+        gathered: list[Any] = [None for _ in range(world_size)]
+        try:
+            torch.distributed.all_gather_object(gathered, kv_cache_specs)
+        except Exception as exc:
+            raise UnsupportedEnvironment(
+                "TP workers could not exchange production KVCacheSpec objects. "
+                "The installed torch/vLLM version must support pickling these "
+                f"specs for standalone planning: {type(exc).__name__}: {exc}"
+            ) from exc
+        if any(not isinstance(item, dict) for item in gathered):
+            raise UnsupportedEnvironment(
+                "TP KVCacheSpec exchange returned a non-dict worker spec."
+            )
+        worker_kv_cache_specs = gathered
+
     kv_num_blocks = plan_blocks(
         kv_vllm_config,
         kv_cache_specs,
         tokens,
         block_size,
+        worker_kv_cache_specs,
+        rank,
     )
-    kv_cache_config = make_layout(
+    if world_size > 1:
+        # Rank 0 is the authority for the bounded test pool.  Every rank still
+        # invokes the production planner below, but with this common block
+        # count, ensuring scheduler and worker views cannot diverge.
+        planned = [kv_num_blocks if rank == 0 else None]
+        torch.distributed.broadcast_object_list(planned, src=0)
+        if planned[0] is None:
+            raise UnsupportedEnvironment("TP rank 0 did not publish KV block count")
+        kv_num_blocks = int(planned[0])
+    worker_kv_cache_configs = make_layouts(
         kv_vllm_config,
         kv_cache_specs,
         kv_num_blocks,
+        worker_kv_cache_specs,
     )
+    if len(worker_kv_cache_configs) != world_size:
+        raise UnsupportedEnvironment(
+            "vLLM returned an unexpected number of TP KV configs: "
+            f"expected={world_size}, actual={len(worker_kv_cache_configs)}"
+        )
+    kv_cache_config = worker_kv_cache_configs[rank]
     if int(kv_cache_config.num_blocks) != kv_num_blocks:
         raise AssertionError(
             f"vLLM ignored num_gpu_blocks_override: "
@@ -682,6 +813,9 @@ def make_cache(
         kv_caches=kv_caches,
         layer_to_group=layer_to_group,
         transfer_layers=transfer_layers,
+        worker_kv_cache_configs=worker_kv_cache_configs,
+        rank=rank,
+        world_size=world_size,
     )
 
 
@@ -689,6 +823,19 @@ def make_worker(fixture: CacheFixture) -> Any:
     """Create the worker-side UCM connector and bind the real KV tensors."""
 
     log_cache_layout(fixture)
+    if fixture.world_size > 1:
+        module_path = str(
+            getattr(
+                getattr(fixture.vllm_config, "kv_transfer_config", None),
+                "kv_connector_module_path",
+                "",
+            )
+        )
+        if ".v2." in module_path or module_path.endswith(".v2.ucm_connector"):
+            raise UnsupportedEnvironment(
+                "TP>1 model-check currently supports native legacy UCM metadata "
+                "only; connector v2 rank-aware scheduling is not yet validated."
+            )
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
@@ -697,6 +844,31 @@ def make_worker(fixture: CacheFixture) -> Any:
     )
     connector.register_kv_caches(fixture.kv_caches)
     return connector
+
+
+def dist_barrier() -> None:
+    """Synchronize TP workers when a distributed group is active."""
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def check_tensor_parallel_connector(
+    tensor_parallel_size: int,
+    connector_module_path: str,
+) -> None:
+    """Reject connector modes whose TP storage namespace is not rank-aware."""
+
+    if tensor_parallel_size <= 1:
+        return
+    if ".v2." in connector_module_path or connector_module_path.endswith(
+        ".v2.ucm_connector"
+    ):
+        raise UnsupportedEnvironment(
+            "TP>1 model-check currently supports the legacy UCM connector "
+            "in layout-only mode; connector v2 rank-aware storage is not yet "
+            "validated."
+        )
 
 
 def _runtime_tensor_signature(value: Any) -> tuple[Any, ...]:
@@ -917,9 +1089,15 @@ def make_scheduler_cache_config(worker_kv_cache_config: Any) -> Any:
 
     import vllm.v1.core.kv_cache_utils as kv_utils
 
+    worker_configs = (
+        list(worker_kv_cache_config)
+        if isinstance(worker_kv_cache_config, (tuple, list))
+        else [worker_kv_cache_config]
+    )
+
     if hasattr(kv_utils, "get_scheduler_kv_cache_config"):
-        return kv_utils.get_scheduler_kv_cache_config([worker_kv_cache_config])
-    scheduler_config = copy.deepcopy(worker_kv_cache_config)
+        return kv_utils.get_scheduler_kv_cache_config(worker_configs)
+    scheduler_config = copy.deepcopy(worker_configs[0])
     try:
         from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
     except Exception:
@@ -941,7 +1119,9 @@ def make_scheduler(
 
     if patch_groups is not None:
         patch_groups(fixture)
-    scheduler_kv_cache_config = make_scheduler_cache_config(fixture.kv_cache_config)
+    scheduler_kv_cache_config = make_scheduler_cache_config(
+        fixture.worker_kv_cache_configs or fixture.kv_cache_config
+    )
     from vllm.v1.structured_output import StructuredOutputManager
 
     scheduler_cls = fixture.vllm_config.scheduler_config.get_scheduler_cls()

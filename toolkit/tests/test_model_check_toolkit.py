@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import os
 import sys
+import types
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -109,6 +110,37 @@ class ModelCheckToolkitTest(unittest.TestCase):
         self.assertEqual(
             {env["UCM_MODEL_CHECK_REQUEST_TOKEN_SALT"] for env in worker_envs},
             {worker_envs[0]["UCM_MODEL_CHECK_REQUEST_TOKEN_SALT"]},
+        )
+
+    def test_worker_launcher_resolves_python_m_main_module(self):
+        class FinishedProcess:
+            def poll(self):
+                return 0
+
+        topology = make_topology(1, "0", master_port=23456)
+        main_module = types.SimpleNamespace(
+            __spec__=types.SimpleNamespace(
+                name="ucm_toolkit.tools.model_check.cuda"
+            )
+        )
+        with (
+            patch.dict(sys.modules, {"__main__": main_module}),
+            patch(
+                "ucm_toolkit.tools.model_check.parallel.subprocess.Popen",
+                return_value=FinishedProcess(),
+            ) as popen,
+            patch("ucm_toolkit.tools.model_check.parallel.time.sleep"),
+        ):
+            result = launch_workers("__main__", topology, {})
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                sys.executable,
+                "-m",
+                "ucm_toolkit.tools.model_check.cuda",
+            ],
         )
 
     def test_worker_launcher_terminates_peers_after_rank_failure(self):

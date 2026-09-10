@@ -547,7 +547,7 @@ def main() -> int:
             master_addr=master_addr,
             master_port=master_port,
         )
-        return launch_workers(__name__, topology, os.environ.copy())
+        return launch_workers(f"{__package__}.cpu", topology, os.environ.copy())
     active_device = torch.device("cpu")
     log(f"device={active_device}")
     vllm_config = None

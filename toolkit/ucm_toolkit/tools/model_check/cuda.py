@@ -287,7 +287,7 @@ def main() -> int:
             master_port=master_port,
         )
         os.environ["CUDA_VISIBLE_DEVICES"] = topology.visible_devices
-        return launch_workers(__name__, topology, os.environ.copy())
+        return launch_workers(f"{__package__}.cuda", topology, os.environ.copy())
     os.environ["CUDA_VISIBLE_DEVICES"] = devices
     local_rank = int(os.environ.get("UCM_MODEL_CHECK_LOCAL_RANK", "0"))
     active_device = torch.device(f"cuda:{local_rank}")

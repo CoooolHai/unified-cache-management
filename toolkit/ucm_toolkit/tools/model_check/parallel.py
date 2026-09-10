@@ -18,6 +18,26 @@ from typing import Mapping
 from .topology import TensorParallelTopology
 
 
+def _resolve_worker_module(module: str) -> str:
+    """Resolve ``python -m`` entrypoints to an importable worker module.
+
+    A module executed with ``python -m package.module`` observes
+    ``__name__ == "__main__"``.  Reusing that value for child workers would
+    launch ``python -m __main__``, which has no importable module spec.
+    """
+
+    if module != "__main__":
+        return module
+    main_spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+    resolved = getattr(main_spec, "name", None)
+    if not resolved or resolved == "__main__":
+        raise RuntimeError(
+            "cannot resolve the model-check worker module from __main__; "
+            "launch the checker with python -m package.module"
+        )
+    return str(resolved)
+
+
 def launch_workers(
     module: str,
     topology: TensorParallelTopology,
@@ -27,6 +47,7 @@ def launch_workers(
 ) -> int:
     """Launch all TP ranks, propagate the first failure, and reap reliably."""
 
+    worker_module = _resolve_worker_module(module)
     env_base = dict(os.environ if base_env is None else base_env)
     # Every rank must hash the exact same synthetic prompt.  The legacy
     # single-rank modules used time_ns^pid at import time, so establish one
@@ -40,7 +61,9 @@ def launch_workers(
             env.update(topology.rank(rank).environment())
             # The parent has already installed the complete physical mask.
             # Keeping it unchanged makes logical rank==CUDA/NPU visible index.
-            process = subprocess.Popen([sys.executable, "-m", module], env=env)
+            process = subprocess.Popen(
+                [sys.executable, "-m", worker_module], env=env
+            )
             processes.append(process)
 
         while processes:

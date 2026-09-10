@@ -332,7 +332,7 @@ def main() -> int:
             master_port=master_port,
         )
         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = topology.visible_devices
-        return launch_workers(__name__, topology, os.environ.copy())
+        return launch_workers(f"{__package__}.ascend", topology, os.environ.copy())
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = devices
     local_rank = int(os.environ.get("UCM_MODEL_CHECK_LOCAL_RANK", "0"))
     active_device = torch.device(f"npu:{local_rank}")

@@ -67,6 +67,7 @@ class KVCacheGroupLayout:
         expected_block_size: Optional[int] = None,
         standardized_layout: bool = False,
         expected_tokens_per_state: int = 1,
+        expected_tokens_per_state_by_layer: Optional[dict[str, int]] = None,
     ) -> None:
         self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
         self.is_ascend_layout = is_ascend_layout
@@ -90,6 +91,18 @@ class KVCacheGroupLayout:
                 f"tokens_per_state={expected_tokens_per_state}."
             )
         self.expected_tokens_per_state = expected_tokens_per_state
+        self.expected_tokens_per_state_by_layer = (
+            dict(expected_tokens_per_state_by_layer or {})
+        )
+        if standardized_layout and expected_tokens_per_state_by_layer is not None:
+            cache_layers = set(self.kvcaches)
+            mapped_layers = set(self.expected_tokens_per_state_by_layer)
+            if mapped_layers != cache_layers:
+                raise ValueError(
+                    "Standardized KV cache layer/tokens_per_state mismatch: "
+                    f"missing={sorted(cache_layers - mapped_layers)!r}, "
+                    f"extra={sorted(mapped_layers - cache_layers)!r}."
+                )
         self.base_ptrs: np.ndarray
         self.block_strides: np.ndarray
         self.tensor_token_strides: np.ndarray
@@ -175,16 +188,30 @@ class KVCacheGroupLayout:
                     # Current vLLM unified views are [B, H, N, C]. N is the
                     # number of physical states, not the logical token block.
                     physical_states = int(tensor.shape[2])
-                    expected_states = (
-                        self.expected_block_size // self.expected_tokens_per_state
-                    )
+                    if self.expected_tokens_per_state_by_layer:
+                        tokens_per_state = (
+                            self.expected_tokens_per_state_by_layer[layer_name]
+                        )
+                    else:
+                        tokens_per_state = self.expected_tokens_per_state
+                    if not isinstance(tokens_per_state, int) or tokens_per_state <= 0:
+                        raise ValueError(
+                            f"Invalid tokens_per_state for {layer_name}: "
+                            f"{tokens_per_state!r}."
+                        )
+                    if self.expected_block_size % tokens_per_state:
+                        raise ValueError(
+                            f"Block size {self.expected_block_size} is not divisible "
+                            f"by tokens_per_state={tokens_per_state} for {layer_name}."
+                        )
+                    expected_states = self.expected_block_size // tokens_per_state
                     if physical_states != expected_states:
                         raise ValueError(
                             f"Standardized KV cache state count mismatch for "
                             f"{layer_name}: N={physical_states}, expected "
                             f"{expected_states} from block_size="
                             f"{self.expected_block_size} and "
-                            f"tokens_per_state={self.expected_tokens_per_state}."
+                            f"tokens_per_state={tokens_per_state}."
                         )
                     ptrs.append(tensor[0].data_ptr())
                     strides.append(tensor.stride(0) * tensor.element_size())
@@ -312,27 +339,31 @@ class KVCacheGroupLayout:
         return int(self.tensor_block_sizes[0])
 
 
-def _group_tokens_per_state(group_spec) -> int:
+def _group_tokens_per_state_by_layer(group_spec) -> dict[str, int]:
     spec = group_spec.kv_cache_spec
     nested = getattr(spec, "kv_cache_specs", None)
     if nested:
-        values = {
-            getattr(inner, "tokens_per_state", 1) for inner in nested.values()
-        }
-        if len(values) != 1:
+        expected = set(group_spec.layer_names)
+        actual = set(nested)
+        if actual != expected:
             raise ValueError(
-                "Standardized KV cache group requires consistent "
-                f"tokens_per_state values, got {sorted(values)!r}."
+                "Uniform KV cache group layer/spec mismatch: "
+                f"missing={sorted(expected - actual)!r}, "
+                f"extra={sorted(actual - expected)!r}."
             )
-        tokens_per_state = values.pop()
+        source = nested
     else:
-        tokens_per_state = getattr(spec, "tokens_per_state", 1)
-    if not isinstance(tokens_per_state, int) or tokens_per_state <= 0:
-        raise ValueError(
-            "Standardized KV cache requires a positive integer "
-            f"tokens_per_state, got {tokens_per_state!r}."
-        )
-    return tokens_per_state
+        source = {name: spec for name in group_spec.layer_names}
+    result = {}
+    for name, inner in source.items():
+        value = getattr(inner, "tokens_per_state", 1)
+        if not isinstance(value, int) or value <= 0:
+            raise ValueError(
+                f"Standardized KV cache requires positive integer "
+                f"tokens_per_state for {name}, got {value!r}."
+            )
+        result[name] = value
+    return result
 
 
 @dataclass
@@ -1003,10 +1034,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 is_ascend_layout=self.is_ascend_layout,
                 expected_block_size=group_spec.kv_cache_spec.block_size,
                 standardized_layout=standardized_layout,
-                expected_tokens_per_state=(
-                    _group_tokens_per_state(group_spec)
+                expected_tokens_per_state=1,
+                expected_tokens_per_state_by_layer=(
+                    _group_tokens_per_state_by_layer(group_spec)
                     if standardized_layout
-                    else 1
+                    else None
                 ),
             )
             self.group_layouts[group_id] = layout

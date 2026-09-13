@@ -186,7 +186,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         )
 
         class Tensor:
-            shape = (2, 1, 16, 4)
+            shape = (2, 1, 32, 4)
             dtype = "bf16"
 
             def __getitem__(self, _index):
@@ -202,7 +202,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
                 return 1
 
             def stride(self, index=None):
-                values = (64, 64, 4, 1)
+                values = (128, 128, 4, 1)
                 return values if index is None else values[index]
 
         module = ast.Module(body=[node], type_ignores=[])
@@ -220,11 +220,73 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         exec(compile(module, str(HMA_PATH), "exec"), namespace)
         layout = namespace["KVCacheGroupLayout"](
             {"model.layers.0.mla": Tensor()},
-            expected_block_size=32,
+            expected_block_size=64,
             standardized_layout=True,
             expected_tokens_per_state=2,
         )
-        self.assertEqual(layout.segment_tensor_size_list(32, 32), [64])
+        self.assertEqual(layout.segment_tensor_size_list(32, 64), [64])
+
+    def test_mixed_tokens_per_state_views_scale_offsets_independently(self):
+        tree = ast.parse(HMA_PATH.read_text(encoding="utf-8"))
+        node = next(
+            n for n in tree.body if getattr(n, "name", None) == "KVCacheGroupLayout"
+        )
+
+        class Tensor:
+            dtype = "bf16"
+
+            def __init__(self, states, ptr):
+                self.shape = (2, 1, states, 4)
+                self.ptr = ptr
+
+            def __getitem__(self, _index):
+                return self
+
+            def data_ptr(self):
+                return self.ptr
+
+            def dim(self):
+                return 4
+
+            def element_size(self):
+                return 1
+
+            def stride(self, index=None):
+                values = (self.shape[1] * self.shape[2] * 4, self.shape[2] * 4, 4, 1)
+                return values if index is None else values[index]
+
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {
+            "math": math,
+            "np": __import__("numpy"),
+            "torch": types.SimpleNamespace(Tensor=Tensor),
+            "Tuple": tuple,
+            "Optional": Optional,
+            "Sequence": Sequence,
+            "extract_layer_index": lambda name: int(name.split(".")[2]),
+            "logger": types.SimpleNamespace(info=lambda *_args: None),
+        }
+        exec(compile(module, str(HMA_PATH), "exec"), namespace)
+        layout = namespace["KVCacheGroupLayout"](
+            {
+                "model.layers.0.full": Tensor(64, 4096),
+                "model.layers.1.compressed": Tensor(32, 8192),
+            },
+            expected_block_size=64,
+            standardized_layout=True,
+            expected_tokens_per_state_by_layer={
+                "model.layers.0.full": 1,
+                "model.layers.1.compressed": 2,
+            },
+        )
+        addresses = layout.extract_addrs_with_offsets(
+            __import__("numpy").array([0, 0]),
+            64,
+            __import__("numpy").array([0, 32]),
+        )
+        self.assertEqual(layout.segment_tensor_size_list(32, 64), [128, 64])
+        self.assertEqual(addresses.tolist(), [[4096, 8192], [4224, 8256]])
 
     def test_transient_slice_keeps_original_group_index(self):
         methods = _load_hma_methods({"_slice_group_block_ids"})
@@ -343,7 +405,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             )
             swa_layers.extend(names)
             spec = types.SimpleNamespace(
-                block_size=64,
+                block_size=32,
                 sliding_window=128,
                 tokens_per_state=1,
                 page_size_bytes=19008,
@@ -358,11 +420,11 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         inner_specs = {
             name: types.SimpleNamespace(
                 block_size=64,
-                tokens_per_state=2,
-                page_size_bytes=1000,
+                tokens_per_state=(1 if i < 4 else 2),
+                page_size_bytes=(2000 if i < 4 else 1000),
                 prefix_cacheable=True,
             )
-            for name in all_fa_names
+            for i, name in enumerate(all_fa_names)
         }
         fa_spec = types.SimpleNamespace(
             block_size=64,
@@ -373,7 +435,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             types.SimpleNamespace(kv_cache_spec=fa_spec, layer_names=all_fa_names)
         )
         ring_spec = types.SimpleNamespace(
-            block_size=16, tokens_per_state=1, prefix_cacheable=False
+            block_size=8, tokens_per_state=1, prefix_cacheable=False
         )
         groups.append(
             types.SimpleNamespace(kv_cache_spec=ring_spec, layer_names=("ring",))
@@ -402,7 +464,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
             max_token_block_size=0,
         )
         methods["_init_group_metas"].__globals__["resolve_kv_cache_block_sizes"] = (
-            lambda *_args: (64, 64)
+            lambda *_args: (64, 32)
         )
         self_obj._specs_for_group = methods["_specs_for_group"]
         self_obj._derive_v41_file_sizes = types.MethodType(
@@ -417,11 +479,12 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         self.assertEqual(self_obj.transient_group_ids, {8})
         self.assertEqual(self_obj.fa_group_ids, [7])
         self.assertEqual(self_obj.window_group_ids, list(range(7)))
-        self.assertEqual(self_obj.hash_block_size, 64)
-        self.assertEqual(self_obj.group_metas[8].token_block_size, 16)
+        self.assertEqual(self_obj.hash_block_size, 32)
+        self.assertEqual(self_obj.group_metas[8].token_block_size, 8)
         self.assertEqual(self_obj.group_metas[8].tail_blocks, 0)
-        expected_fa = (8 * 1000 + 4095) // 4096 * 4096
-        expected_wa = (40 * 19008 * 2 + 4095) // 4096 * 4096
+        expected_fa = (4 * 2000 + 4 * 1000) * 32 // 64
+        expected_fa = (expected_fa + 4095) // 4096 * 4096
+        expected_wa = (40 * 19008 * 4 + 4095) // 4096 * 4096
         self.assertEqual(
             self_obj.file_size, {"FA": expected_fa, "WA": expected_wa}
         )

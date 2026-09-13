@@ -14,6 +14,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
 
+try:
+    from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
+except ImportError:  # Older vLLM versions do not expose this helper.
+    resolve_kv_cache_block_sizes = None
+
 from ucm.integration.vllm.device import create_device
 from ucm.integration.vllm.ucm_connector import (
     UCMDirectConnector,
@@ -60,10 +65,31 @@ class KVCacheGroupLayout:
         *,
         is_ascend_layout: bool = False,
         expected_block_size: Optional[int] = None,
+        standardized_layout: bool = False,
+        expected_tokens_per_state: int = 1,
     ) -> None:
         self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
         self.is_ascend_layout = is_ascend_layout
         self.expected_block_size = expected_block_size
+        self.standardized_layout = standardized_layout
+        if standardized_layout and (
+            expected_block_size is None or expected_block_size <= 0
+        ):
+            raise ValueError(
+                "Standardized KV cache layout requires a positive block size."
+            )
+        if standardized_layout and expected_tokens_per_state <= 0:
+            raise ValueError(
+                "Standardized KV cache layout requires positive "
+                f"tokens_per_state, got {expected_tokens_per_state}."
+            )
+        if standardized_layout and expected_block_size % expected_tokens_per_state:
+            raise ValueError(
+                "Standardized KV cache block size must be divisible by "
+                f"tokens_per_state: block_size={expected_block_size}, "
+                f"tokens_per_state={expected_tokens_per_state}."
+            )
+        self.expected_tokens_per_state = expected_tokens_per_state
         self.base_ptrs: np.ndarray
         self.block_strides: np.ndarray
         self.tensor_token_strides: np.ndarray
@@ -145,6 +171,39 @@ class KVCacheGroupLayout:
                 handle_tensor(tensor[0], (-3, -2, -1), layer_name)
                 handle_tensor(tensor[1], (-3, -2, -1), layer_name)
             elif tensor.dim() == 4:
+                if self.standardized_layout:
+                    # Current vLLM unified views are [B, H, N, C]. N is the
+                    # number of physical states, not the logical token block.
+                    physical_states = int(tensor.shape[2])
+                    expected_states = (
+                        self.expected_block_size // self.expected_tokens_per_state
+                    )
+                    if physical_states != expected_states:
+                        raise ValueError(
+                            f"Standardized KV cache state count mismatch for "
+                            f"{layer_name}: N={physical_states}, expected "
+                            f"{expected_states} from block_size="
+                            f"{self.expected_block_size} and "
+                            f"tokens_per_state={self.expected_tokens_per_state}."
+                        )
+                    ptrs.append(tensor[0].data_ptr())
+                    strides.append(tensor.stride(0) * tensor.element_size())
+                    tensor_size = math.prod(tensor.shape[1:]) * tensor.element_size()
+                    tensor_token_strides.append(
+                        tensor.stride(2) * tensor.element_size()
+                    )
+                    tensor_sizes_per_token.append(tensor_size // physical_states)
+                    tensor_block_sizes.append(physical_states)
+                    view_meta.append(
+                        (
+                            layer_name,
+                            tuple(tensor.shape),
+                            tuple(tensor.stride()),
+                            str(tensor.dtype),
+                            physical_states,
+                        )
+                    )
+                    return
                 if self._is_combined_kv_4d(tensor.shape, layer_name):
                     # GPU kernels may register [num_blocks, 2, block_size, ...];
                     # split the K/V axis before reading the token dimension.
@@ -251,6 +310,29 @@ class KVCacheGroupLayout:
                 f"{self.tensor_block_sizes.tolist()}"
             )
         return int(self.tensor_block_sizes[0])
+
+
+def _group_tokens_per_state(group_spec) -> int:
+    spec = group_spec.kv_cache_spec
+    nested = getattr(spec, "kv_cache_specs", None)
+    if nested:
+        values = {
+            getattr(inner, "tokens_per_state", 1) for inner in nested.values()
+        }
+        if len(values) != 1:
+            raise ValueError(
+                "Standardized KV cache group requires consistent "
+                f"tokens_per_state values, got {sorted(values)!r}."
+            )
+        tokens_per_state = values.pop()
+    else:
+        tokens_per_state = getattr(spec, "tokens_per_state", 1)
+    if not isinstance(tokens_per_state, int) or tokens_per_state <= 0:
+        raise ValueError(
+            "Standardized KV cache requires a positive integer "
+            f"tokens_per_state, got {tokens_per_state!r}."
+        )
+    return tokens_per_state
 
 
 @dataclass
@@ -374,6 +456,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"FAWA KV group config: fa_groups={self.fa_group_ids}, "
             f"window_groups={self.window_group_ids}, "
             f"hash_block_size={self.hash_block_size}, "
+            f"transient_group_ids={sorted(self.transient_group_ids)}, "
+            f"is_v41_layout={self.is_v41_layout}, "
             f"ascend_base_block_size={self.ascend_base_block_size}, "
             f"is_ascend_layout={self.is_ascend_layout}, "
             f"group_metas={group_meta_summary}"
@@ -480,6 +564,17 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             )
 
         groups = self._kv_cache_config.kv_cache_groups
+        self.transient_group_ids = {
+            group_id
+            for group_id, group in enumerate(groups)
+            if getattr(group.kv_cache_spec, "prefix_cacheable", True) is False
+        }
+        hf_config = self._vllm_config.model_config.hf_config
+        self.is_v41_layout = bool(
+            self.transient_group_ids
+            or getattr(hf_config, "kv_source_layer_ids", None)
+            or getattr(hf_config, "index_source_layer_ids", None)
+        )
         self.fa_group_ids, self.window_group_ids = [], []
         layer_compress_ratios = getattr(
             self._vllm_config.model_config.hf_config,
@@ -488,13 +583,52 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
         if layer_compress_ratios is None:
             raise ValueError("current only support DSV4")
+        compressed_ratios = {int(ratio) for ratio in layer_compress_ratios}
+        self.is_v41_layout |= compressed_ratios.issubset({0, 1, 2}) and bool(
+            compressed_ratios & {1, 2}
+        )
+        if self.is_v41_layout:
+            if resolve_kv_cache_block_sizes is None:
+                raise RuntimeError(
+                    "DeepSeek V4.1 requires vLLM's "
+                    "resolve_kv_cache_block_sizes helper."
+                )
+            try:
+                resolved = resolve_kv_cache_block_sizes(
+                    self._kv_cache_config, self._vllm_config
+                )
+                if not (
+                    isinstance(resolved, tuple)
+                    and len(resolved) == 2
+                    and all(isinstance(size, int) and size > 0 for size in resolved)
+                ):
+                    raise TypeError(
+                        "expected (scheduler_block_size, hash_block_size), "
+                        f"got {resolved!r}"
+                    )
+                # vLLM returns (scheduler_block_size, hash_block_size).
+                self.hash_block_size = int(resolved[1])
+            except Exception as exc:
+                raise RuntimeError(
+                    "Unable to resolve DeepSeek V4.1 scheduler hash block size "
+                    "with resolve_kv_cache_block_sizes."
+                ) from exc
         for group_id, group in enumerate(groups):
             kv_cache_spec = group.kv_cache_spec
             # Use the representative spec when vLLM wraps multiple layer specs.
             nested_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
             spec = next(iter(nested_specs.values())) if nested_specs else kv_cache_spec
+            if group_id in self.transient_group_ids:
+                # Keep a metadata entry so scheduler/worker tuples retain the
+                # vLLM group index, but never put the transient ring in a store.
+                self.group_metas[group_id] = KVCacheGroupMeta(
+                    group_id, kv_cache_spec.block_size, 0, 0
+                )
+                continue
             window_size = getattr(spec, "sliding_window", None)
-            compress_ratio = getattr(spec, "compress_ratio", 1)
+            compress_ratio = getattr(spec, "compress_ratio", None)
+            if compress_ratio is None:
+                compress_ratio = getattr(spec, "tokens_per_state", 1)
             token_block_size = kv_cache_spec.block_size
             if self.is_ascend_layout:
                 # Ascend compressed groups expose a logical block span scaled by
@@ -529,11 +663,24 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         logger.info_once(
             f"max token_block_size of all groups: {self.max_token_block_size}"
         )
-        if self.max_token_block_size % self.hash_block_size != 0:
+        if (
+            self.max_token_block_size
+            and self.max_token_block_size % self.hash_block_size != 0
+        ):
             raise ValueError(
                 f"Maximum token block size {self.max_token_block_size} must be "
                 f"divisible by hash block size {self.hash_block_size}."
             )
+        # V4.1 layouts derive payloads from the actual KV specs.  V4.0 keeps
+        # the established model-specific sizing for compatibility.
+        if self.is_v41_layout:
+            self.file_size = self._derive_v41_file_sizes(groups)
+            logger.info(
+                "DeepSeek V4.1 excludes transient ring groups from UCM stores; "
+                "SWA persistent groups remain stored."
+            )
+            return
+
         # get file size for block gc
         if len(layer_compress_ratios) < 61:
             # for dsv4 flash
@@ -578,6 +725,74 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             ) * num_c4a_layers
         self.file_size["FA"] = round_up(self.file_size["FA"], 4096)
         self.file_size["WA"] = round_up(self.file_size["WA"], 4096)
+
+    @staticmethod
+    def _specs_for_group(group) -> list[object]:
+        spec = group.kv_cache_spec
+        nested = getattr(spec, "kv_cache_specs", None)
+        if nested:
+            missing = [name for name in group.layer_names if name not in nested]
+            if missing:
+                raise ValueError(
+                    f"KV cache group is missing specs for layers {missing!r}."
+                )
+            return [nested[name] for name in group.layer_names]
+        return [spec] * len(group.layer_names)
+
+    def _derive_v41_file_sizes(self, groups) -> dict[str, int]:
+        sizes = {"FA": 0, "WA": 0}
+        for group_id, group in enumerate(groups):
+            if group_id in self.transient_group_ids:
+                continue
+            if group_id in self.fa_group_ids:
+                label = "FA"
+            elif group_id in self.window_group_ids:
+                label = "WA"
+            else:
+                raise ValueError(
+                    f"V4.1 persistent group {group_id} is neither FA nor WA."
+                )
+            payload = 0
+            meta = self.group_metas[group_id]
+            segment_tokens = meta.tail_tokens // meta.tail_blocks
+            if segment_tokens <= 0 or meta.tail_blocks <= 0:
+                raise ValueError(
+                    f"V4.1 group {group_id} has invalid tail metadata: {meta}"
+                )
+            for spec in self._specs_for_group(group):
+                page_size = next(
+                    (
+                        getattr(spec, name, None)
+                        for name in (
+                            "unpadded_page_size_bytes",
+                            "real_page_size_bytes",
+                            "page_size_bytes",
+                        )
+                        if getattr(spec, name, None) is not None
+                    ),
+                    None,
+                )
+                if page_size is None:
+                    raise ValueError(
+                        f"V4.1 group {group_id} layer spec {type(spec).__name__} "
+                        "has no page-size byte attribute."
+                    )
+                spec_block_size = getattr(spec, "block_size", None)
+                if not isinstance(spec_block_size, int) or spec_block_size <= 0:
+                    raise ValueError(
+                        f"V4.1 group {group_id} has invalid spec block size "
+                        f"{spec_block_size!r}."
+                    )
+                numerator = int(page_size) * segment_tokens
+                if numerator % spec_block_size:
+                    raise ValueError(
+                        f"V4.1 group {group_id} page payload {page_size} does "
+                        f"not scale evenly for segment_tokens={segment_tokens} "
+                        f"and spec.block_size={spec_block_size}."
+                    )
+                payload += numerator // spec_block_size
+            sizes[label] += payload * meta.tail_blocks
+        return {label: round_up(size, 4096) for label, size in sizes.items()}
 
     def _create_fa_store(
         self,
@@ -719,7 +934,13 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             padded_size = round_up(sum(tensor_size_list), aligned_size)
             config["shard_size"] = padded_size
             config["block_size"] = padded_size
-            if self.file_size[label] != padded_size:
+            if self.file_size[label] != padded_size and self.is_v41_layout:
+                raise ValueError(
+                    f"V4.1 FAWA {label} payload mismatch: scheduler derived "
+                    f"{self.file_size[label]} bytes, worker layout padded to "
+                    f"{padded_size} bytes from tensor_size_list={tensor_size_list}."
+                )
+            if self.file_size[label] != padded_size and not self.is_v41_layout:
                 logger.info_once(
                     f"GC file size of {label} does not match real file size. "
                     f"Worker: {padded_size}, Scheduler: {self.file_size[label]}"
@@ -759,17 +980,34 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             self.device.split_cores(self.device_id) if enable_affinity else (None, None)
         )
 
+        standardized_layers = {
+            layer
+            for raw_tensor in self._kv_cache_config.kv_cache_tensors
+            for layer in (getattr(raw_tensor, "layers", None) or ())
+        }
         for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
+            if group_id in self.transient_group_ids:
+                continue
             group_caches: dict[str, torch.Tensor] = {}
             for layer_name in group_spec.layer_names:
                 if isinstance(kv_caches[layer_name], torch.Tensor):
                     group_caches[layer_name] = kv_caches[layer_name]
                 else:
                     group_caches[layer_name] = tuple(kv_caches[layer_name])
+            standardized_layout = any(
+                layer_name in standardized_layers
+                for layer_name in group_spec.layer_names
+            )
             layout = KVCacheGroupLayout(
                 group_caches,
                 is_ascend_layout=self.is_ascend_layout,
                 expected_block_size=group_spec.kv_cache_spec.block_size,
+                standardized_layout=standardized_layout,
+                expected_tokens_per_state=(
+                    _group_tokens_per_state(group_spec)
+                    if standardized_layout
+                    else 1
+                ),
             )
             self.group_layouts[group_id] = layout
 
@@ -974,6 +1212,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         """Select the physical group blocks needed for FA or WA store rows."""
 
         is_window_group = group_id in self.window_group_ids
+        if group_id in self.transient_group_ids:
+            return []
         group_meta = self.group_metas[group_id]
         if is_window_group:
             if not group_meta.tail_tokens:

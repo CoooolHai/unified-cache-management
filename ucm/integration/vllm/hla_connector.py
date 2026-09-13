@@ -109,6 +109,18 @@ def is_mamba_align_kv_cache_spec(spec: KVCacheSpec) -> bool:
     return isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align"
 
 
+def _raw_tensor_layers(raw_tensor: Any) -> tuple[str, ...]:
+    """Return layer names from either the current or legacy KV tensor API."""
+    layers = getattr(raw_tensor, "layers", None)
+    if layers is None:
+        layers = getattr(raw_tensor, "shared_by", None)
+    if layers is None:
+        return ()
+    if isinstance(layers, str):
+        return (layers,)
+    return tuple(layers)
+
+
 def extend_non_null(
     dst_ucm_block_ids: list[bytes],
     dst_vllm_block_ids: list[int],
@@ -552,7 +564,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         shared_specs: list[KVCacheSpec] = []
         shared_ptrs: list[int] = []
         layer_to_specs = layer_name_to_kv_cache_spec(self.kv_cache_config)
-        for layer_name in raw_tensor.shared_by:
+        for layer_name in _raw_tensor_layers(raw_tensor):
             kv_layer = kvcaches.get(layer_name)
             if kv_layer is None:
                 continue
@@ -693,7 +705,8 @@ class HybridLinearAttentionLayout(KVCacheLayout):
         is_npu = current_platform.device_type == "npu"
 
         for raw_tensor in self.kv_cache_config.kv_cache_tensors:
-            if not raw_tensor.shared_by:
+            tensor_layers = _raw_tensor_layers(raw_tensor)
+            if not tensor_layers:
                 continue
 
             shared_specs, shared_ptrs = self._collect_shared_tensor_info(
@@ -702,7 +715,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
 
             if not shared_ptrs:
                 logger.warning(
-                    f"no kv cache tensor found for shared layers {raw_tensor.shared_by}"
+                    f"no kv cache tensor found for shared layers {tensor_layers}"
                 )
                 continue
 
@@ -742,7 +755,7 @@ class HybridLinearAttentionLayout(KVCacheLayout):
                     block_stride_lists,
                 )
 
-            for layer_name in raw_tensor.shared_by:
+            for layer_name in tensor_layers:
                 self.layer_name_to_row[layer_name] = row_id
 
         self._finalize_layout_arrays(
@@ -776,7 +789,7 @@ class UCMHybridLinearAttentionConnector(UCMDirectConnector, SupportsHMA):
         for raw_tensor in kv_cache_config.kv_cache_tensors:
             shared_specs = [
                 spec
-                for layer_name in raw_tensor.shared_by
+                for layer_name in _raw_tensor_layers(raw_tensor)
                 for spec in layer_to_specs.get(layer_name, [])
             ]
             if any(

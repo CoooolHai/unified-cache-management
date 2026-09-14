@@ -1084,6 +1084,10 @@ class UCMDirectConnector(KVConnectorBase_V1):
     cross-rank consistency metadata.
     """
 
+    @classmethod
+    def _supports_request_async_load(cls) -> bool:
+        return cls is UCMDirectConnector
+
     @staticmethod
     def _consistency_manager_enabled(launch_config: dict, is_mla: bool) -> bool:
         return launch_config.get("use_consistency_manager", not is_mla)
@@ -1211,16 +1215,12 @@ class UCMDirectConnector(KVConnectorBase_V1):
         request_async_configured = bool(
             self.launch_config.get("use_request_async_load", False)
         )
-        # Keep the first implementation deliberately scoped to the direct
-        # connector. Layerwise, CP and HMA connectors have different task and
-        # block-layout semantics and must opt in separately.
         self.use_request_async_load = (
-            request_async_configured and type(self) is UCMDirectConnector
+            request_async_configured and self._supports_request_async_load()
         )
         if request_async_configured and not self.use_request_async_load:
             logger.warning(
-                "Request-async loading is currently supported only by "
-                "UCMDirectConnector; disabling it for %s.",
+                "Request-async loading is not supported by %s; disabling it.",
                 type(self).__name__,
             )
         # Scheduler-side plans waiting to be included in connector metadata.

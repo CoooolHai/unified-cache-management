@@ -302,7 +302,12 @@ def _install_stubs():
     _install_package("ucm", REPO_ROOT / "ucm")
     _install_package("ucm.integration", REPO_ROOT / "ucm" / "integration")
     _install_package("ucm.integration.vllm", REPO_ROOT / "ucm" / "integration" / "vllm")
-    _install_module("torch", Tensor=type("Tensor", (), {}))
+    _install_module(
+        "torch",
+        Tensor=type("Tensor", (), {}),
+        dtype=type("dtype", (), {}),
+        empty=lambda *args, **kwargs: SimpleNamespace(element_size=lambda: 1),
+    )
     _install_module(
         "prometheus_client",
         Counter=FakeCounter,
@@ -350,6 +355,7 @@ def _install_stubs():
         KVCacheConfig=type("KVCacheConfig", (), {}),
         KVCacheSpec=type("KVCacheSpec", (), {}),
         MambaSpec=type("MambaSpec", (), {}),
+        MLAAttentionSpec=type("MLAAttentionSpec", (), {}),
         SlidingWindowSpec=type("SlidingWindowSpec", (), {}),
         UniformTypeKVCacheSpecs=type("UniformTypeKVCacheSpecs", (), {}),
     )
@@ -360,6 +366,7 @@ def _install_stubs():
     _install_module(
         "ucm.integration.vllm.device",
         create_device=lambda *args, **kwargs: None,
+        get_current_device_id=lambda: 0,
     )
     _install_module("ucm.logger", init_logger=lambda name: _Logger())
     _install_module("ucm.shared.metrics", ucmmetrics=fake_ucmmetrics)
@@ -374,6 +381,7 @@ def _install_stubs():
     )
     _install_module("ucm.utils", Config=FakeConfig)
     _install_module("ucm.sparse.state", has_ucm_sparse=lambda *args, **kwargs: False)
+    _install_module("ucm.sparse.utils", round_up=lambda value, multiple: value)
 
 
 _install_stubs()
@@ -389,6 +397,17 @@ from ucm.integration.vllm.ucm_connector import (
     UCMConnector,
     UCMDirectConnector,
     UCMLayerWiseConnector,
+)
+from ucm.integration.vllm.hla_connector import (
+    HLARequestMeta,
+    UCMHybridLinearAttentionConnector,
+)
+from ucm.integration.vllm.hma_connector import (
+    FAWALoadTask,
+    FAWAPendingLoad,
+    FAWARequestDispatchMeta,
+    FAWARequestMeta,
+    UCMFAWAConnector,
 )
 from ucm.metrics_config import (
     consumer_enabled,
@@ -1727,6 +1746,281 @@ def test_request_async_poll_failure_unblocks_and_invalidates_blocks():
     assert connector._pending_load_tasks == {}
     assert connector._connector_worker_meta.failed == {"req-async"}
     assert connector._invalid_block_ids == {40, 41}
+
+
+def test_request_async_connector_capabilities_are_explicit():
+    """Non-direct connectors must opt in explicitly (layerwise stays off)."""
+    hla = pytest.importorskip("ucm.integration.vllm.hla_connector")
+    hma = pytest.importorskip("ucm.integration.vllm.hma_connector")
+    assert UCMDirectConnector._supports_request_async_load() is True
+    assert hla.UCMHybridLinearAttentionConnector._supports_request_async_load() is True
+    assert hma.UCMFAWAConnector._supports_request_async_load() is True
+    assert (
+        hla.UCMHybridLinearAttentionLayerWiseConnector._supports_request_async_load()
+        is False
+    )
+    assert UCMLayerWiseConnector._supports_request_async_load() is False
+
+
+def test_fawa_dispatch_meta_async_field_is_kw_only_and_defaulted():
+    hma = pytest.importorskip("ucm.integration.vllm.hma_connector")
+    meta = hma.FAWARequestDispatchMeta()
+    assert meta.load_async is False
+    meta = hma.FAWARequestDispatchMeta(load_async=True)
+    assert meta.load_async is True
+
+
+def test_fawa_pending_load_accumulates_success_bytes():
+    hma = pytest.importorskip("ucm.integration.vllm.hma_connector")
+    pending = hma.FAWAPendingLoad("req")
+    pending.successful_bytes += 128
+    pending.successful_bytes += 256
+    assert pending.successful_bytes == 384
+
+
+def test_unknown_direct_subclass_does_not_inherit_async_capability():
+    class UnknownDirect(UCMDirectConnector):
+        pass
+
+    assert UnknownDirect._supports_request_async_load() is False
+
+
+def _fake_hla_connector():
+    connector = object.__new__(UCMHybridLinearAttentionConnector)
+    connector.use_request_async_load = True
+    connector.is_mla = False
+    connector.requests_meta = {}
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = set()
+    connector._async_dump_req_ids = set()
+    connector.group_manager = SimpleNamespace(
+        num_groups=2,
+        lcm_block_size=4,
+        groups_by_id=[
+            SimpleNamespace(block_size=4, is_mamba_align=False),
+            SimpleNamespace(block_size=4, is_mamba_align=False),
+        ],
+    )
+    return connector
+
+
+def test_hla_async_allocation_builds_full_group_load_only_dispatch():
+    connector = _fake_hla_connector()
+    connector.requests_meta["r"] = HLARequestMeta(
+        ucm_block_ids=[b"a0", b"a1", b"b0", b"b1"],
+        hbm_hit_block_num=0,
+        total_hit_block_num=2,
+        num_token_ids=8,
+        token_processed=8,
+        group_ucm_block_ids=[[b"a0", b"a1"], [b"b0", b"b1"]],
+        group_vllm_block_ids=[[], []],
+    )
+    connector.update_state_after_alloc(
+        SimpleNamespace(request_id="r"),
+        SimpleNamespace(get_block_ids=lambda: ([10, 11], [20, 21])),
+        8,
+    )
+    meta = connector._pending_async_load_dispatches["r"]
+    assert meta.load_async is True
+    assert meta.dump_block_ids == ([], [])
+    assert meta.load_block_ids[1] == [10, 11, 20, 21]
+    assert connector.requests_meta["r"].token_processed == 8
+
+
+def test_hla_build_dispatches_waiting_request_and_resumed_cached_safely():
+    connector = _fake_hla_connector()
+    connector.requests_meta["r"] = HLARequestMeta(
+        ucm_block_ids=[b"a0", b"a1", b"b0", b"b1"],
+        hbm_hit_block_num=0, total_hit_block_num=2, num_token_ids=8,
+        token_processed=8,
+        group_ucm_block_ids=[[b"a0", b"a1"], [b"b0", b"b1"]],
+        group_vllm_block_ids=[[10, 11], [20, 21]],
+    )
+    connector.update_state_after_alloc(
+        SimpleNamespace(request_id="r"),
+        SimpleNamespace(get_block_ids=lambda: ([10, 11], [20, 21])), 8,
+    )
+    empty = SimpleNamespace(
+        scheduled_new_reqs=[], scheduled_cached_reqs=[], num_scheduled_tokens={},
+        finished_req_ids=set(), preempted_req_ids=None,
+    )
+    metadata = connector.build_connector_meta(empty)
+    assert "r" in metadata.request_meta
+    assert metadata.request_meta["r"].load_async is True
+
+    cached = SimpleNamespace(
+        req_id="r", new_block_ids=([], []), resumed_from_preemption=True
+    )
+    output = SimpleNamespace(
+        scheduled_new_reqs=[], scheduled_cached_reqs=[cached],
+        num_scheduled_tokens={"r": 0}, finished_req_ids=set(),
+        preempted_req_ids=None,
+    )
+    resumed = connector.build_connector_meta(output)
+    assert resumed.request_meta["r"].load_block_ids == ([], [])
+
+
+def test_hla_async_poll_uses_common_pending_lifecycle():
+    connector = _fake_hla_connector()
+    connector._finished_async_load_req_ids = set()
+    connector._pending_load_tasks = {
+        "r": PendingLoadTask(object(), "r", [10, 20])
+    }
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+    connector._invalid_block_ids = set()
+
+    class RC:
+        ready = False
+        def check_load(self, task):
+            return self.ready
+        def wait_load(self, task):
+            self.waited = True
+    connector._rank_consistency = RC()
+    assert connector._poll_pending_load_tasks() == set()
+    connector._rank_consistency.ready = True
+    assert connector._poll_pending_load_tasks() == {"r"}
+
+
+def test_hla_async_start_submits_without_waiting():
+    connector = _fake_hla_connector()
+    connector._pending_load_tasks = {}
+    connector._finished_async_load_req_ids = set()
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+    connector._invalid_block_ids = set()
+    connector.is_mla = False
+    connector.tp_rank = connector.tp_size = 1
+    connector.device = SimpleNamespace(synchronize=lambda: None)
+    connector.store = object()
+    class FakeArray:
+        shape = (2, 1)
+        def reshape(self, *args):
+            return self
+
+    connector.kv_cache_layout = SimpleNamespace(
+        extract_block_addrs=lambda ids: FakeArray()
+    )
+    task = object()
+    waited = []
+    connector._rank_consistency = SimpleNamespace(
+        submit_load=lambda *args: task,
+        check_load=lambda task: True,
+        wait_load=lambda task: waited.append(task),
+    )
+    dispatch = SimpleNamespace(
+        load_block_ids=([b"u0", b"u1"], [10, 20]),
+        dump_block_ids=([], []), load_async=True, load_full_attn_count=0,
+    )
+    connector._get_connector_metadata = lambda: ucm_connector_module.UCMConnectorMetadata(
+        {"r": dispatch}, set()
+    )
+    connector.start_load_kv(None)
+    assert connector._pending_load_tasks["r"].task is task
+    assert waited == []
+    assert connector._poll_pending_load_tasks() == {"r"}
+    assert waited == [task]
+
+
+def test_fawa_async_poll_waits_for_both_tasks_and_accumulates_bytes():
+    fake_ucmmetrics.updated.clear()
+    connector = object.__new__(UCMFAWAConnector)
+    connector._finished_async_load_req_ids = set()
+    connector._invalid_block_ids = set()
+    connector._pending_fawa_loads = {}
+    connector.file_size = {"FA": 10, "WA": 20}
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+
+    class RC:
+        def __init__(self):
+            self.ready = {"fa": True, "wa": False}
+            self.waited = []
+        def check_load(self, task):
+            return self.ready[task]
+        def wait_load(self, task):
+            self.waited.append(task)
+    rc = RC()
+    connector._rank_consistency = rc
+    fa = FAWALoadTask("r", "FA", object(), "fa", 3)
+    wa = FAWALoadTask("r", "WA", object(), "wa", 2)
+    connector._pending_fawa_loads["r"] = FAWAPendingLoad(
+        "r", [fa, wa], {10, 20}, False
+    )
+    assert connector._poll_pending_fawa_loads() == set()
+    assert rc.waited == ["fa"]
+    rc.ready["wa"] = True
+    assert connector._poll_pending_fawa_loads() == {"r"}
+    assert rc.waited == ["fa", "wa"]
+    assert connector._pending_fawa_loads == {}
+    assert fake_ucmmetrics.updated[-1] == {"load_bytes_total": 70}
+
+
+def test_fawa_async_allocation_passes_all_groups_without_duplicate_append():
+    connector = object.__new__(UCMFAWAConnector)
+    connector.use_request_async_load = True
+    connector.requests_meta = {
+        "r": FAWARequestMeta(
+            ucm_block_ids=[b"u0", b"u1"], hbm_hit_block_num=0,
+            total_hit_block_num=2, num_token_ids=512, token_processed=0,
+        )
+    }
+    connector.group_metas = {0: object(), 1: object()}
+    connector._pending_async_load_dispatches = {}
+    connector._async_load_req_ids = set()
+    captured = {}
+    def generate(meta, new_tokens, block_ids, need_load=True):
+        captured["block_ids"] = block_ids
+        assert all(not ids for ids in block_ids)
+        return FAWARequestDispatchMeta(load_keys=[b"u0", b"u1"])
+    connector._generate_dispatch_meta = generate
+    connector.update_state_after_alloc(
+        SimpleNamespace(request_id="r"),
+        SimpleNamespace(get_block_ids=lambda: ([10, 11], [20, 21])), 512,
+    )
+    assert captured["block_ids"] == ([], [])
+    assert connector._pending_async_load_dispatches["r"].load_async is True
+    assert connector.requests_meta["r"].vllm_block_ids == ([10, 11], [20, 21])
+
+
+def test_fawa_get_finished_preserves_sending_and_merges_receiving():
+    connector = object.__new__(UCMFAWAConnector)
+    connector._drain_best_effort_dump_tasks = lambda ids: None
+    connector._rank_consistency = SimpleNamespace(finish_dump=lambda ids: None)
+    connector._poll_pending_fawa_loads = lambda: {"recv"}
+    sending, receiving = connector.get_finished({"send"})
+    assert sending == {"send"}
+    assert receiving == {"recv"}
+
+
+def test_fawa_async_failure_keeps_persistent_invalid_blocks_until_drain():
+    connector = object.__new__(UCMFAWAConnector)
+    connector._finished_async_load_req_ids = set()
+    connector._pending_fawa_loads = {}
+    connector._invalid_block_ids = set()
+    failed = set()
+    connector._connector_worker_meta = SimpleNamespace(
+        mark_failed=lambda req: failed.add(req)
+    )
+
+    class RC:
+        def check_load(self, task):
+            if task == "fa":
+                raise RuntimeError("failed")
+            return False
+        def wait_load(self, task):
+            pass
+    connector._rank_consistency = RC()
+    connector.file_size = {"FA": 1, "WA": 1}
+    connector._record_load_error = lambda metric, ids: connector._invalid_block_ids.update(ids)
+    connector._pending_fawa_loads["r"] = FAWAPendingLoad(
+        "r",
+        [FAWALoadTask("r", "FA", object(), "fa", 1),
+         FAWALoadTask("r", "WA", object(), "wa", 1)],
+        {101, 202},
+    )
+    assert connector._poll_pending_fawa_loads() == set()
+    assert failed == {"r"}
+    connector._rank_consistency.check_load = lambda task: True
+    assert connector._poll_pending_fawa_loads() == {"r"}
+    assert connector._invalid_block_ids == {101, 202}
 
 
 def test_multiproc_logger_uses_prefix_and_dispatcher_snapshot(tmp_path):

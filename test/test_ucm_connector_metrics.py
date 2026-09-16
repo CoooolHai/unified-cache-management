@@ -3537,3 +3537,26 @@ def test_direct_step_metrics_empty_step_resets_interval(monkeypatch):
         {"direct_step_scheduled_tokens": 0, "direct_step_scheduled_requests": 0},
         {"direct_step_scheduled_tokens": 1, "direct_step_scheduled_requests": 1},
     ]
+
+
+def test_connector_dashboard_contains_direct_stepwise_feasibility_panels():
+    dashboard = json.loads(
+        (REPO_ROOT / "examples" / "metrics" / "grafana_connector.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    panels = {panel["title"]: panel for panel in dashboard["panels"]}
+
+    load_panel = panels["Direct Sync vs Async Load Duration"]
+    step_panel = panels["Direct Scheduler Step Interval"]
+    load_exprs = "\n".join(target["expr"] for target in load_panel["targets"])
+    step_exprs = "\n".join(target["expr"] for target in step_panel["targets"])
+
+    assert panels["Direct Step-wise Feasibility"]["gridPos"]["y"] == 48
+    assert load_panel["gridPos"] == {"h": 8, "w": 12, "x": 0, "y": 49}
+    assert step_panel["gridPos"] == {"h": 8, "w": 12, "x": 12, "y": 49}
+    assert "ucm:direct_sync_load_duration_ms_bucket" in load_exprs
+    assert "ucm:direct_async_load_duration_ms_bucket" in load_exprs
+    assert "ucm:direct_step_interval_ms_bucket" in step_exprs
+    assert 'worker_rank="scheduler"' in step_exprs
+    assert panels["Failures"]["gridPos"]["y"] == 57

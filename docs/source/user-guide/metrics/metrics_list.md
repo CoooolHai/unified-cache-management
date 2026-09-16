@@ -2,7 +2,7 @@
 
 ## 1. Metrics Exported by Default
 
-The tables below use the default `ucm:` prefix. The default configuration contains 78 Counters, 14 Gauges, and 64 Histograms.
+The tables below use the default `ucm:` prefix. The default configuration contains 81 Counters, 15 Gauges, and 71 Histograms.
 
 See [UCM Health Metrics](health_metrics.md) for Store health metrics and recommended aggregation.
 
@@ -19,10 +19,15 @@ See [UCM Health Metrics](health_metrics.md) for Store health metrics and recomme
 | `ucm:ucm_hit_tokens_total`            | Prefix tokens hit by the UCM Connector                            |
 | `ucm:total_prefix_query_blocks_total` | Total complete prefix blocks queried by the UCM Connector         |
 | `ucm:gpu_hbm_hit_blocks_total`        | Complete prefix blocks already found in GPU/HBM before UCM Lookup |
+| `ucm:direct_async_load_dispatched_total` | Direct request-async load dispatch attempts, including failed submits (per-rank worker) |
+| `ucm:direct_async_load_completed_total` | Direct request-async load tasks completed successfully (per-rank worker) |
+| `ucm:direct_async_load_failed_total` | Direct request-async load tasks that failed (per-rank worker) |
 
 #### Gauges
 
-No Connector-specific Gauges are exported by default.
+| Metric | Description |
+| ------ | ----------- |
+| `ucm:direct_async_load_pending` | Current pending Direct request-async load tasks in each worker (per-rank) |
 
 #### Histograms
 
@@ -52,6 +57,13 @@ No Connector-specific Gauges are exported by default.
 | `ucm:connector_clear_connector_metadata_duration_ms`    | Duration of Connector interface `clear_connector_metadata`                |
 | `ucm:layerwise_layer_load_duration_ms`                  | Per-layer wall-clock time from layer load start to `wait_for_layer_load` return |
 | `ucm:layerwise_batch_load_duration_sum_ms`              | Sum of per-layer load durations within one Layerwise batch               |
+| `ucm:direct_sync_load_duration_ms`                      | Direct synchronous load wall-clock duration per attempted request load |
+| `ucm:direct_async_load_duration_ms`                     | Direct request-async load duration from dispatch through completion or failure (worker-side) |
+| `ucm:direct_load_tokens`                                | Direct load payload token count per successfully submitted request load |
+| `ucm:direct_load_bytes`                                 | Direct load payload bytes per successfully submitted request load |
+| `ucm:direct_step_interval_ms`                           | Scheduler-visible interval between active Direct `build_connector_meta` calls; an interval proxy, not `execute_model` duration; connector-invisible idle time should be filtered by warm-up/time window |
+| `ucm:direct_step_scheduled_tokens`                      | Total tokens scheduled in one scheduler output step |
+| `ucm:direct_step_scheduled_requests`                    | Number of requests scheduled in one scheduler output step |
 
 ### 1.2 Cache Store
 

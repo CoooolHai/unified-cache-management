@@ -308,6 +308,7 @@ class FAWAPendingLoad:
     vllm_block_ids: set[int] = field(default_factory=set)
     failed: bool = False
     successful_bytes: int = 0
+    invalid_error_recorded: bool = False
 
 
 @dataclass
@@ -1229,6 +1230,22 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         )
         self._connector_worker_meta.mark_failed(request_id)
 
+    def _record_fawa_load_error(
+        self, pending: FAWAPendingLoad, metric_name: str
+    ) -> None:
+        """Record one task error while invalidating a request only once.
+
+        A FAWA request has two independent store tasks.  Each task should
+        contribute to its task-level error metric, but a request-level
+        invalidation must not be counted twice when both tasks fail.
+        """
+        if pending.invalid_error_recorded:
+            ucmmetrics.update_stats({metric_name: 1.0})
+            self._invalid_block_ids.update(pending.vllm_block_ids)
+            return
+        pending.invalid_error_recorded = True
+        self._record_load_error(metric_name, pending.vllm_block_ids)
+
     def _wait_load_task(
         self,
         load_task: FAWALoadTask,
@@ -1423,20 +1440,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     f"error. {type(e).__name__}: {e}"
                 )
                 pending.failed = True
-                self._record_load_error(
-                    "connector_load_submit_errors_total", pending.vllm_block_ids
-                )
-                self._connector_worker_meta.mark_failed(request_id)
                 if request.load_async:
+                    self._record_fawa_load_error(
+                        pending, "connector_load_submit_errors_total"
+                    )
+                    self._connector_worker_meta.mark_failed(request_id)
                     if pending.tasks:
                         self._pending_fawa_loads[request_id] = pending
                     else:
                         self._finished_async_load_req_ids.add(request_id)
                 else:
-                    # The submit error is already recorded above.  Keep any
-                    # previously submitted sync task in the normal wait list;
-                    # do not relabel the submit failure as a wait failure.
-                    pass
+                    # Keep the historical sync behavior: invalidate both the
+                    # load and dump blocks through the request metadata.
+                    self._handle_load_err(request_id)
 
         sync_tasks = [
             task
@@ -1463,8 +1479,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     )
                 except Exception as e:
                     pending.failed = True
-                    self._record_load_error(
-                        "connector_load_wait_errors_total", pending.vllm_block_ids
+                    self._record_fawa_load_error(
+                        pending, "connector_load_wait_errors_total"
                     )
                     self._connector_worker_meta.mark_failed(request_id)
                     logger.error(
@@ -1740,10 +1756,19 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         finished_req_ids: set[str],
     ) -> tuple[set[str] | None, set[str] | None]:
         # Worker side method
+        # A request can be reported as finished by the scheduler while its
+        # remote FA/WA loads are still in flight (notably on cancellation).
+        # Do not let that release/recycle its HBM blocks until the load reaches
+        # a terminal state.  Capture this before polling because a task that
+        # completes in this call must not appear in both result sets.
+        pending_async_loads = set(getattr(self, "_pending_fawa_loads", {}))
         finished_recving = self._poll_pending_fawa_loads()
         self._drain_best_effort_dump_tasks(finished_req_ids)
         self._rank_consistency.finish_dump(finished_req_ids)
-        return finished_req_ids, finished_recving or None
+        finished_sending = set(finished_req_ids)
+        finished_sending.difference_update(pending_async_loads)
+        finished_sending.difference_update(finished_recving)
+        return finished_sending or None, finished_recving or None
 
     def request_finished_all_groups(
         self,

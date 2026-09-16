@@ -407,6 +407,7 @@ from ucm.integration.vllm.hma_connector import (
     FAWAPendingLoad,
     FAWARequestDispatchMeta,
     FAWARequestMeta,
+    UCMFAWAConnectorMetadata,
     UCMFAWAConnector,
 )
 from ucm.metrics_config import (
@@ -1982,12 +1983,142 @@ def test_fawa_async_allocation_passes_all_groups_without_duplicate_append():
 
 def test_fawa_get_finished_preserves_sending_and_merges_receiving():
     connector = object.__new__(UCMFAWAConnector)
+    connector._pending_fawa_loads = {}
     connector._drain_best_effort_dump_tasks = lambda ids: None
     connector._rank_consistency = SimpleNamespace(finish_dump=lambda ids: None)
     connector._poll_pending_fawa_loads = lambda: {"recv"}
     sending, receiving = connector.get_finished({"send"})
     assert sending == {"send"}
     assert receiving == {"recv"}
+
+
+def test_fawa_get_finished_holds_cancelled_request_while_async_load_pending():
+    connector = object.__new__(UCMFAWAConnector)
+    connector._pending_fawa_loads = {"cancelled": object()}
+    connector._drain_best_effort_dump_tasks = lambda ids: None
+    connector._rank_consistency = SimpleNamespace(finish_dump=lambda ids: None)
+    connector._poll_pending_fawa_loads = lambda: set()
+
+    sending, receiving = connector.get_finished({"cancelled"})
+
+    assert sending is None
+    assert receiving is None
+
+
+def test_fawa_get_finished_excludes_pending_and_receiving_from_sending():
+    connector = object.__new__(UCMFAWAConnector)
+    connector._pending_fawa_loads = {"pending": object(), "done": object()}
+    connector._drain_best_effort_dump_tasks = lambda ids: None
+    connector._rank_consistency = SimpleNamespace(finish_dump=lambda ids: None)
+    connector._poll_pending_fawa_loads = lambda: {"done"}
+
+    sending, receiving = connector.get_finished({"pending", "done", "send"})
+
+    assert sending == {"send"}
+    assert receiving == {"done"}
+
+
+def test_fawa_async_task_failures_count_request_once_but_tasks_twice():
+    fake_ucmmetrics.updated.clear()
+    connector = object.__new__(UCMFAWAConnector)
+    connector._finished_async_load_req_ids = set()
+    connector._pending_fawa_loads = {
+        "r": FAWAPendingLoad(
+            "r",
+            [
+                FAWALoadTask("r", "FA", object(), "fa", 1),
+                FAWALoadTask("r", "WA", object(), "wa", 1),
+            ],
+            {101, 202},
+        )
+    }
+    connector._invalid_block_ids = set()
+    connector.file_size = {"FA": 1, "WA": 1}
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+
+    class RC:
+        def check_load(self, task):
+            return True
+
+        def wait_load(self, task):
+            raise RuntimeError("load failed")
+
+    connector._rank_consistency = RC()
+
+    assert connector._poll_pending_fawa_loads() == {"r"}
+    stats = {}
+    for update in fake_ucmmetrics.updated:
+        for name, value in update.items():
+            stats[name] = stats.get(name, 0) + value
+    assert stats["connector_load_wait_errors_total"] == 2
+    assert stats["connector_load_invalid_requests_total"] == 1
+    assert stats["connector_load_invalid_blocks_total"] == 2
+
+
+def _fawa_start_load_connector(request, submit_load):
+    connector = object.__new__(UCMFAWAConnector)
+    connector._pending_fawa_loads = {}
+    connector._finished_async_load_req_ids = set()
+    connector._invalid_block_ids = set()
+    connector.fa_store = object()
+    connector.wa_store = object()
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+    connector._extract_fa_ptr = lambda *args: object()
+    connector._extract_wa_ptr = lambda *args: object()
+    connector._submit_load_task = submit_load
+    connector._wait_all_load_task = lambda tasks: None
+    connector._get_connector_metadata = lambda: UCMFAWAConnectorMetadata(
+        {request.request_id: request}, set()
+    )
+    return connector
+
+
+def test_fawa_async_submit_error_invalidates_only_load_blocks():
+    request = FAWARequestDispatchMeta(
+        load_keys=[b"k"],
+        load_vllm_block_ids=([11], [22]),
+        load_async=True,
+    )
+    request.request_id = "r"
+
+    def submit_load(*args):
+        raise RuntimeError("submit failed")
+
+    connector = _fawa_start_load_connector(request, submit_load)
+    recorded = []
+    connector._record_load_error = lambda metric, ids: recorded.append(
+        (metric, set(ids))
+    )
+
+    connector.start_load_kv(None)
+
+    assert recorded == [
+        ("connector_load_submit_errors_total", {11, 22})
+    ]
+
+
+def test_fawa_sync_submit_error_invalidates_load_and_dump_blocks():
+    request = FAWARequestDispatchMeta(
+        load_keys=[b"k"],
+        load_vllm_block_ids=([11], [22]),
+        dump_vllm_block_ids=([33],),
+    )
+    request.request_id = "r"
+
+    def submit_load(*args):
+        raise RuntimeError("submit failed")
+
+    connector = _fawa_start_load_connector(request, submit_load)
+    recorded = []
+    connector._record_load_error = lambda metric, ids: recorded.append(
+        (metric, set(ids))
+    )
+
+    connector.start_load_kv(None)
+
+    assert recorded == [
+        ("connector_load_wait_errors_total", {11, 22, 33})
+    ]
 
 
 def test_fawa_async_failure_keeps_persistent_invalid_blocks_until_drain():
@@ -3253,3 +3384,156 @@ def test_pipeline_dashboard_contains_only_performance_panels_with_chinese_hints(
         any("\u4e00" <= char <= "\u9fff" for char in panel["description"])
         for panel in all_panels
     )
+
+
+def test_direct_load_and_step_metrics_have_defined_semantics():
+    config = load_launch_metrics_config({})
+    definitions = {item.name: item for item in get_metric_definitions(config)}
+
+    assert definitions["direct_sync_load_duration_ms"].metric_type == "histogram"
+    assert definitions["direct_async_load_duration_ms"].metric_type == "histogram"
+    assert definitions["direct_load_tokens"].metric_type == "histogram"
+    assert definitions["direct_load_bytes"].metric_type == "histogram"
+    assert definitions["direct_step_interval_ms"].metric_type == "histogram"
+    assert definitions["direct_step_scheduled_tokens"].metric_type == "histogram"
+    assert definitions["direct_step_scheduled_requests"].metric_type == "histogram"
+    assert definitions["direct_async_load_dispatched_total"].metric_type == "counter"
+    assert definitions["direct_async_load_completed_total"].metric_type == "counter"
+    assert definitions["direct_async_load_failed_total"].metric_type == "counter"
+    assert definitions["direct_async_load_pending"].metric_type == "gauge"
+
+
+def test_direct_async_load_metrics_track_success_and_pending_cleanup(monkeypatch):
+    _reset_fakes()
+    connector = object.__new__(UCMDirectConnector)
+    connector._direct_metrics_enabled = True
+    connector._direct_async_load_pending = 1
+    connector._finished_async_load_req_ids = set()
+    connector._pending_load_tasks = {
+        "req-1": PendingLoadTask(
+            object(), "req-1", [10], start_time=10.0
+        )
+    }
+
+    class RankConsistency:
+        def check_load(self, task):
+            return True
+
+        def wait_load(self, task):
+            return None
+
+    connector._rank_consistency = RankConsistency()
+    times = iter([10.025])
+    monkeypatch.setattr(ucm_connector_module.time, "perf_counter", lambda: next(times))
+
+    assert connector._poll_pending_load_tasks() == {"req-1"}
+    assert connector._pending_load_tasks == {}
+    assert connector._direct_async_load_pending == 0
+    stats = {}
+    for update in fake_ucmmetrics.updated:
+        stats.update(update)
+    assert stats["direct_async_load_completed_total"] == 1.0
+    assert stats["direct_async_load_pending"] == 0
+    assert stats["direct_async_load_duration_ms"] == 25.0
+
+
+def test_direct_async_load_submit_or_wait_failure_is_counted_and_timed(monkeypatch):
+    _reset_fakes()
+    connector = object.__new__(UCMDirectConnector)
+    connector._direct_metrics_enabled = True
+    connector._direct_async_load_pending = 1
+    connector._finished_async_load_req_ids = set()
+    connector._pending_load_tasks = {
+        "req-1": PendingLoadTask(object(), "req-1", [10], start_time=20.0)
+    }
+    connector._record_load_error = lambda *args: None
+    connector._connector_worker_meta = SimpleNamespace(mark_failed=lambda req: None)
+
+    class RankConsistency:
+        def check_load(self, task):
+            return True
+
+        def wait_load(self, task):
+            raise RuntimeError("load failed")
+
+    connector._rank_consistency = RankConsistency()
+    monkeypatch.setattr(ucm_connector_module.time, "perf_counter", lambda: 20.04)
+
+    assert connector._poll_pending_load_tasks() == {"req-1"}
+    stats = {}
+    for update in fake_ucmmetrics.updated:
+        stats.update(update)
+    assert stats["direct_async_load_failed_total"] == 1.0
+    assert stats["direct_async_load_pending"] == 0
+    assert stats["direct_async_load_duration_ms"] == 40.0
+
+
+def test_direct_step_metrics_are_scheduler_only_and_use_call_interval(monkeypatch):
+    _reset_fakes()
+    connector = object.__new__(UCMDirectConnector)
+    connector._direct_metrics_enabled = True
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._direct_step_last_start = None
+    outputs = SimpleNamespace(num_scheduled_tokens={"a": 3, "b": 5})
+    times = iter([10.0, 10.02])
+    monkeypatch.setattr(ucm_connector_module.time, "perf_counter", lambda: next(times))
+
+    connector._record_direct_step_interval(outputs)
+    connector._record_direct_step_interval(outputs)
+
+    assert fake_ucmmetrics.updated == [
+        {
+            "direct_step_scheduled_tokens": 8,
+            "direct_step_scheduled_requests": 2,
+        },
+        {
+            "direct_step_interval_ms": 20.0,
+            "direct_step_scheduled_tokens": 8,
+            "direct_step_scheduled_requests": 2,
+        },
+    ]
+
+
+def test_direct_step_metrics_keep_honest_long_active_interval(monkeypatch):
+    _reset_fakes()
+    connector = object.__new__(UCMDirectConnector)
+    connector._direct_metrics_enabled = True
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._direct_step_last_start = None
+    outputs = SimpleNamespace(num_scheduled_tokens={"a": 1})
+    times = iter([10.0, 12.0])
+    monkeypatch.setattr(ucm_connector_module.time, "perf_counter", lambda: next(times))
+
+    connector._record_direct_step_interval(outputs)
+    connector._record_direct_step_interval(outputs)
+
+    assert fake_ucmmetrics.updated == [
+        {"direct_step_scheduled_tokens": 1, "direct_step_scheduled_requests": 1},
+        {
+            "direct_step_interval_ms": 2000.0,
+            "direct_step_scheduled_tokens": 1,
+            "direct_step_scheduled_requests": 1,
+        },
+    ]
+
+
+def test_direct_step_metrics_empty_step_resets_interval(monkeypatch):
+    _reset_fakes()
+    connector = object.__new__(UCMDirectConnector)
+    connector._direct_metrics_enabled = True
+    connector._role = KVConnectorRole.SCHEDULER
+    connector._direct_step_last_start = None
+    active = SimpleNamespace(num_scheduled_tokens={"a": 1})
+    empty = SimpleNamespace(num_scheduled_tokens={})
+    times = iter([10.0, 20.0])
+    monkeypatch.setattr(ucm_connector_module.time, "perf_counter", lambda: next(times))
+
+    connector._record_direct_step_interval(active)
+    connector._record_direct_step_interval(empty)
+    connector._record_direct_step_interval(active)
+
+    assert fake_ucmmetrics.updated == [
+        {"direct_step_scheduled_tokens": 1, "direct_step_scheduled_requests": 1},
+        {"direct_step_scheduled_tokens": 0, "direct_step_scheduled_requests": 0},
+        {"direct_step_scheduled_tokens": 1, "direct_step_scheduled_requests": 1},
+    ]

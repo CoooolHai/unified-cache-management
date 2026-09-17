@@ -3547,16 +3547,19 @@ def test_connector_dashboard_contains_direct_stepwise_feasibility_panels():
     )
     panels = {panel["title"]: panel for panel in dashboard["panels"]}
 
-    load_panel = panels["Direct Sync vs Async Load Duration"]
+    sync_panel = panels["Direct Sync Load Duration"]
+    async_panel = panels["Direct Async Load Duration"]
     step_panel = panels["Direct Scheduler Step Interval"]
-    load_exprs = "\n".join(target["expr"] for target in load_panel["targets"])
+    sync_exprs = "\n".join(target["expr"] for target in sync_panel["targets"])
+    async_exprs = "\n".join(target["expr"] for target in async_panel["targets"])
     step_exprs = "\n".join(target["expr"] for target in step_panel["targets"])
 
     assert panels["Direct Step-wise Feasibility"]["gridPos"]["y"] == 48
-    assert load_panel["gridPos"] == {"h": 8, "w": 12, "x": 0, "y": 49}
-    assert step_panel["gridPos"] == {"h": 8, "w": 12, "x": 12, "y": 49}
-    assert "ucm:direct_sync_load_duration_ms_bucket" in load_exprs
-    assert "ucm:direct_async_load_duration_ms_bucket" in load_exprs
+    assert sync_panel["gridPos"] == {"h": 8, "w": 12, "x": 0, "y": 49}
+    assert async_panel["gridPos"] == {"h": 8, "w": 12, "x": 12, "y": 49}
+    assert step_panel["gridPos"] == {"h": 8, "w": 24, "x": 0, "y": 57}
+    assert "ucm:direct_sync_load_duration_ms_bucket" in sync_exprs
+    assert "ucm:direct_async_load_duration_ms_bucket" in async_exprs
     assert "ucm:direct_step_interval_ms_bucket" in step_exprs
     assert 'worker_rank="scheduler"' in step_exprs
-    assert panels["Failures"]["gridPos"]["y"] == 57
+    assert panels["Failures"]["gridPos"]["y"] == 66

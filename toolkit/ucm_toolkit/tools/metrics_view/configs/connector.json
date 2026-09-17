@@ -970,6 +970,105 @@
       "unit": "ms"
     },
     {
+      "name": "Direct Sync Load Duration: sync p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:direct_sync_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Sync Load Duration: sync p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:direct_sync_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Sync Load Duration: sync p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:direct_sync_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Async Load Duration: async p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Async Load Duration: async p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Async Load Duration: async p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Scheduler Step Interval: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:direct_step_interval_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=\"scheduler\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Scheduler Step Interval: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:direct_step_interval_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=\"scheduler\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Direct Scheduler Step Interval: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:direct_step_interval_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=\"scheduler\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
       "name": "Failure Counts by Type: {failure_type}",
       "type": "promql",
       "expr": "sort_desc(label_replace(sum by (__name__) (increase({__name__=~\"ucm:.*(errors|failure_events)_total\", model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__range])), \"failure_type\", \"$1\", \"__name__\", \"ucm:(.*)\"))",

@@ -197,7 +197,7 @@
   "refresh": "",
   "title": "vLLM - UCM Connector (vLLM Metrics)",
   "uid": "ucm-vllm-connector-overview",
-  "version": 2,
+  "version": 3,
   "id": null,
   "tags": [
     "ucm-vllm-connector-metrics",
@@ -2330,7 +2330,7 @@
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
       },
-      "description": "指标：`ucm:direct_sync_load_duration_ms` 与 `ucm:direct_async_load_duration_ms`；对比 DirectConnector 同步和 request-async 外部加载的墙钟耗时分布。代码位置：`ucm/integration/vllm/ucm_connector.py` / `UCMDirectConnector.start_load_kv` 与 `_poll_pending_load_tasks`。TP 多卡实验建议选择单个 `worker_rank`，例如 rank 0。",
+      "description": "指标：`ucm:direct_sync_load_duration_ms`；DirectConnector 同步外部加载的墙钟耗时分布。代码位置：`ucm/integration/vllm/ucm_connector.py` / `UCMDirectConnector.start_load_kv`。TP 多卡实验建议选择单个 `worker_rank`，例如 rank 0。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2405,7 +2405,59 @@
           "legendFormat": "sync p99 {{engine}} {{worker_rank}}",
           "range": true,
           "refId": "C"
+        }
+      ],
+      "title": "Direct Sync Load Duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "指标：`ucm:direct_async_load_duration_ms`；DirectConnector request-async 外部加载从 dispatch 到完成或失败的墙钟耗时分布。代码位置：`ucm/integration/vllm/ucm_connector.py` / `UCMDirectConnector._poll_pending_load_tasks`。TP 多卡实验建议选择单个 `worker_rank`，例如 rank 0。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 0,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": 60000
+          },
+          "unit": "ms"
         },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 49
+      },
+      "id": 54,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "maxHeight": "50%",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "prometheus",
@@ -2415,7 +2467,7 @@
           "expr": "histogram_quantile(0.5, sum by (le, ${perWorker:raw}) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "async p50 {{engine}} {{worker_rank}}",
           "range": true,
-          "refId": "D"
+          "refId": "A"
         },
         {
           "datasource": {
@@ -2426,7 +2478,7 @@
           "expr": "histogram_quantile(0.9, sum by (le, ${perWorker:raw}) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "async p90 {{engine}} {{worker_rank}}",
           "range": true,
-          "refId": "E"
+          "refId": "B"
         },
         {
           "datasource": {
@@ -2437,10 +2489,10 @@
           "expr": "histogram_quantile(0.99, sum by (le, ${perWorker:raw}) (rate(ucm:direct_async_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
           "legendFormat": "async p99 {{engine}} {{worker_rank}}",
           "range": true,
-          "refId": "F"
+          "refId": "C"
         }
       ],
-      "title": "Direct Sync vs Async Load Duration",
+      "title": "Direct Async Load Duration",
       "type": "timeseries"
     },
     {
@@ -2469,9 +2521,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 49
+        "w": 24,
+        "x": 0,
+        "y": 57
       },
       "id": 53,
       "options": {
@@ -2534,7 +2586,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 57
+        "y": 66
       },
       "id": 21,
       "panels": [],
@@ -2573,7 +2625,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 58
+        "y": 67
       },
       "id": 22,
       "options": {
@@ -2659,7 +2711,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 58
+        "y": 67
       },
       "id": 23,
       "options": {
@@ -2769,7 +2821,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 67
+        "y": 76
       },
       "id": 24,
       "options": {

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
@@ -489,7 +490,7 @@ def _v41_whole_page_sizes(kv_cache_config) -> dict[str, int]:
 
 
 def _ascend_v41_whole_page_sizes(kv_cache_config) -> dict[str, int]:
-    """Select one page-origin view per group/allocation for Ascend 0.30."""
+    """Select physical page owners for persistent Ascend V4.1 groups."""
     sizes = {}
     tensors = getattr(kv_cache_config, "kv_cache_tensors", ())
     if not tensors:
@@ -498,12 +499,42 @@ def _ascend_v41_whole_page_sizes(kv_cache_config) -> dict[str, int]:
         spec = group.kv_cache_spec
         nested = getattr(spec, "kv_cache_specs", None)
         specs = list(nested.values()) if nested else [spec]
+        if any(
+            getattr(s, "prefix_replay_tokens", 0) > 0
+            and getattr(s, "prefix_cacheable", True)
+            for s in [spec, *specs]
+        ):
+            raise ValueError(
+                "Ascend V4.1 replay SWA must be marked prefix_cacheable=False."
+            )
         if not all(getattr(s, "prefix_cacheable", True) for s in specs):
-            if not all(type(s).__name__ == "CircularBufferSpec" for s in specs):
+            is_ring = all(type(s).__name__ == "CircularBufferSpec" for s in specs)
+            is_replay_swa = all(
+                getattr(s, "model_version", None) == "deepseek_v41"
+                and not getattr(s, "prefix_cacheable", True)
+                and getattr(s, "prefix_replay_tokens", 0) > 0
+                and s.prefix_replay_tokens == getattr(s, "sliding_window", None)
+                for s in specs
+            )
+            if not (is_ring or is_replay_swa):
                 raise ValueError(
-                    "Ascend V4.1 UCM requires persisted SWA windows; "
-                    "bounded replay and other transient groups are not supported."
+                    "Ascend V4.1 transient groups must contain only compressor "
+                    "rings or SWA specs declaring a full bounded replay window."
                 )
+            if is_replay_swa and (
+                getattr(spec, "prefix_cacheable", True)
+                or any(
+                    s.prefix_replay_tokens
+                    != getattr(spec, "prefix_replay_tokens", 0)
+                    for s in specs
+                )
+            ):
+                raise ValueError(
+                    "Ascend V4.1 grouped SWA spec must preserve its layers' "
+                    "prefix_cacheable=False and common prefix_replay_tokens."
+                )
+            # Keep the scheduler's group and local KV allocation. Only omit
+            # its page owners from UCM transfer; the worker rebuilds SWA.
             continue
         if not getattr(group, "enable_kv_transfer", True):
             raise ValueError("Ascend V4.1 cannot omit a persistent KV group.")
@@ -539,6 +570,25 @@ def _ascend_v41_whole_page_sizes(kv_cache_config) -> dict[str, int]:
                 f"Missing Ascend V4.1 page descriptors: {sorted(remaining)}"
             )
     return sizes
+
+
+def _validate_ascend_v41_replay_protocol() -> None:
+    """Require the external-prefix replay contract, not just an SWA flag."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    if not (
+        callable(getattr(Scheduler, "_mark_prefix_replay", None))
+        and callable(getattr(Scheduler, "_load_restores_replay_window", None))
+        and callable(
+            getattr(KVConnectorBase_V1, "get_loaded_kv_cache_group_ids", None)
+        )
+    ):
+        raise RuntimeError(
+            "Ascend V4.1 UCM bounded replay requires vLLM's external-KV "
+            "replay protocol (scheduler rewind and loaded KV group reporting). "
+            "Use a compatible vLLM/vLLM-Ascend build, or disable "
+            "swa_bounded_replay to persist SWA windows."
+        )
 
 
 def _group_physical_layout_by_layer(
@@ -660,7 +710,8 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     Full-attention groups are stored once per reusable prefix block and are
     loaded for every external prefix hit. WA groups store the tail blocks
     needed at each prefix boundary, and only the final matched boundary is
-    loaded.
+    loaded. Bounded replay makes SWA groups transient: UCM transfers only FA,
+    and the engine rebuilds SWA by replaying the hit's final window.
     """
 
     DEFAULT_HASH_BLOCK_SIZE = 256
@@ -950,7 +1001,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 )
             self.hash_block_size = self.ascend_base_block_size = block_sizes.pop()
             if self.prefix_replay_tokens:
-                raise ValueError("Ascend V4.1 UCM does not support bounded replay.")
+                _validate_ascend_v41_replay_protocol()
+                replay_windows = {
+                    group.kv_cache_spec.prefix_replay_tokens
+                    for group in groups
+                    if getattr(group.kv_cache_spec, "prefix_replay_tokens", 0)
+                }
+                if len(replay_windows) != 1:
+                    raise ValueError(
+                        "Ascend V4.1 SWA groups must agree on one replay window."
+                    )
         else:
             self.whole_page_sizes = (
                 _v41_whole_page_sizes(self._kv_cache_config)
@@ -992,7 +1052,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             spec = next(iter(nested_specs.values())) if nested_specs else kv_cache_spec
             if group_id in self.transient_group_ids:
                 # Keep a metadata entry so scheduler/worker tuples retain the
-                # vLLM group index, but never put the transient ring in a store.
+                # vLLM group index, but never store transient rings or SWA.
                 self.group_metas[group_id] = KVCacheGroupMeta(
                     group_id, kv_cache_spec.block_size, 0, 0
                 )
@@ -1081,6 +1141,16 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                     "DeepSeek V4.1 hash block size must be divisible by the "
                     "KV compression group size: "
                     f"hash_block_size={self.hash_block_size}, "
+                    f"compression_group_size={self.resume_token_alignment}."
+                )
+            if (
+                self.is_ascend_v41_layout
+                and self.prefix_replay_tokens % self.resume_token_alignment
+            ):
+                raise ValueError(
+                    "Ascend V4.1 replay window must align to the KV compression "
+                    "group size so replay starts with a fresh compressor ring: "
+                    f"replay_tokens={self.prefix_replay_tokens}, "
                     f"compression_group_size={self.resume_token_alignment}."
                 )
         # V4.1 layouts derive payloads from the actual KV specs.  V4.0 keeps
@@ -1296,24 +1366,27 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             self._role != KVConnectorRole.WORKER and dp_rank == 0
         )
         if config.get("posix_capacity_gb", None) is not None:
-            config["posix_capacity_gb"] = int(config["posix_capacity_gb"]) // 2
+            store_count = 2 if self.window_group_ids else 1
+            config["posix_capacity_gb"] = (
+                int(config["posix_capacity_gb"]) // store_count
+            )
         return name, module_path, config
 
     def _set_default_shm_buffer_capacity(self, config: dict[str, object]) -> None:
         if not bool(config.get("share_buffer_enable", False)):
             return
 
-        # HMA creates two shared-buffer stores, FA and WA, so split the
-        # shared-buffer capacity evenly between them, whether user-set or the
-        # 128GB direct-connector default.
+        # Divide the capacity among stores that actually exist. Replay-only
+        # SWA needs no WA store, so FA can use the full configured capacity.
         if config.get("cache_buffer_capacity_gb") is None:
             config["cache_buffer_capacity_gb"] = 128
         capacity = int(config["cache_buffer_capacity_gb"])
-        config["cache_buffer_capacity_gb"] = max(capacity // 2, 1)
+        store_count = 2 if self.window_group_ids else 1
+        config["cache_buffer_capacity_gb"] = max(capacity // store_count, 1)
         logger.info(
             f"Set FAWA cache_buffer_capacity_gb to "
             f"{config['cache_buffer_capacity_gb']}GB by splitting the "
-            f"{capacity}GB shared-buffer capacity across FA/WA stores."
+            f"{capacity}GB shared-buffer capacity across {store_count} store(s)."
         )
         # The shared buffer is allocated via shm_open in /dev/shm; fail early
         # (before store creation) if the tmpfs cannot hold the FA+WA total.

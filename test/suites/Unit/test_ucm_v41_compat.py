@@ -6,12 +6,14 @@ import ctypes
 import hashlib
 import math
 import pickle
+import sys
 import types
 import unittest
 from collections import namedtuple
 from collections.abc import Callable
 from pathlib import Path
 from typing import Optional, Sequence
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 HMA_PATH = ROOT / "ucm/integration/vllm/hma_connector.py"
@@ -27,7 +29,11 @@ def _load_hma_methods(names):
         n
         for n in tree.body
         if getattr(n, "name", None)
-        in ("_v41_whole_page_sizes", "_ascend_v41_whole_page_sizes")
+        in (
+            "_v41_whole_page_sizes",
+            "_ascend_v41_whole_page_sizes",
+            "_validate_ascend_v41_replay_protocol",
+        )
     ]
     module = ast.Module(body=helpers + nodes, type_ignores=[])
     ast.fix_missing_locations(module)
@@ -244,6 +250,151 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         self.assertEqual(connector.group_metas[2].tail_tokens, 256)
         self.assertEqual(connector.group_metas[2].tail_blocks, 2)
 
+    @staticmethod
+    def _ascend_v41_replay_connector():
+        methods, connector = UCMV41CompatibilityTest._ascend_v41_connector()
+        spec = connector._kv_cache_config.kv_cache_groups[2].kv_cache_spec
+        for inner in [spec, *spec.kv_cache_specs.values()]:
+            inner.prefix_cacheable = False
+            inner.prefix_replay_tokens = 256
+        # Layout tests isolate the protocol dependency; the guard itself is
+        # exercised below with supported and incomplete engine interfaces.
+        methods["_validate_ascend_v41_replay_protocol"] = lambda: None
+        return methods, connector
+
+    def test_ascend_replay_omits_wa_store_and_preserves_group_indices(self):
+        methods, worker = self._ascend_v41_replay_connector()
+        scheduler = copy.deepcopy(worker)
+        for group in scheduler._kv_cache_config.kv_cache_groups:
+            nested = getattr(group.kv_cache_spec, "kv_cache_specs", None)
+            if nested:
+                group.kv_cache_spec = next(iter(nested.values()))
+        for connector in (worker, scheduler):
+            methods["_init_group_metas"](connector)
+            self.assertEqual(connector.fa_group_ids, [0])
+            self.assertEqual(connector.window_group_ids, [])
+            self.assertEqual(connector.transient_group_ids, {1, 2})
+            self.assertEqual(connector.prefix_replay_tokens, 256)
+            self.assertEqual(connector.file_size, {"FA": 524288, "WA": 0})
+            self.assertEqual(set(connector.group_metas), {0, 1, 2})
+            self.assertEqual(connector.group_metas[2].tail_tokens, 0)
+            self.assertEqual(len(connector.whole_page_sizes), 2)
+            self.assertTrue(
+                all(
+                    name.endswith(".long_kv_cache")
+                    for name in connector.whole_page_sizes
+                )
+            )
+            connector._create_store = mock.Mock(
+                side_effect=AssertionError("WA store must not be created")
+            )
+            create = _load_hma_methods({"_create_wa_store"})["_create_wa_store"]
+            self.assertIsNone(create(connector, None))
+            connector._create_store.assert_not_called()
+        self.assertEqual(worker.whole_page_sizes, scheduler.whole_page_sizes)
+
+    def test_ascend_replay_rejects_inconsistent_specs_and_unaligned_window(self):
+        for change in (
+            "cacheable",
+            "missing_group_window",
+            "missing_layer_window",
+            "partial_window",
+            "mixed_windows",
+            "compression_alignment",
+        ):
+            with self.subTest(change=change):
+                methods, connector = self._ascend_v41_replay_connector()
+                group = connector._kv_cache_config.kv_cache_groups[2]
+                spec = group.kv_cache_spec
+                inner = next(iter(spec.kv_cache_specs.values()))
+                if change == "cacheable":
+                    spec.prefix_cacheable = True
+                elif change == "missing_group_window":
+                    spec.prefix_replay_tokens = 0
+                elif change == "missing_layer_window":
+                    inner.prefix_replay_tokens = 0
+                elif change == "partial_window":
+                    inner.sliding_window = 512
+                elif change == "mixed_windows":
+                    second = copy.deepcopy(group)
+                    second.kv_cache_spec.prefix_replay_tokens = 128
+                    for child in second.kv_cache_spec.kv_cache_specs.values():
+                        child.prefix_replay_tokens = child.sliding_window = 128
+                    connector._kv_cache_config.kv_cache_groups.append(second)
+                else:
+                    spec.prefix_replay_tokens = 129
+                    for child in spec.kv_cache_specs.values():
+                        child.prefix_replay_tokens = child.sliding_window = 129
+                with self.assertRaises(ValueError):
+                    methods["_init_group_metas"](connector)
+
+    def test_ascend_replay_requires_external_kv_protocol(self):
+        methods = _load_hma_methods(set())
+        validate = methods["_validate_ascend_v41_replay_protocol"]
+        for missing in (None, "rewind", "loaded_window", "loaded_groups"):
+            with self.subTest(missing=missing):
+                scheduler = types.SimpleNamespace(
+                    _mark_prefix_replay=lambda: None,
+                    _load_restores_replay_window=lambda: None,
+                )
+                base = types.SimpleNamespace(get_loaded_kv_cache_group_ids=lambda: ())
+                if missing == "rewind":
+                    del scheduler._mark_prefix_replay
+                elif missing == "loaded_window":
+                    del scheduler._load_restores_replay_window
+                elif missing == "loaded_groups":
+                    del base.get_loaded_kv_cache_group_ids
+                module = types.ModuleType("vllm.v1.core.sched.scheduler")
+                module.Scheduler = scheduler
+                methods["KVConnectorBase_V1"] = base
+                with mock.patch.dict(sys.modules, {module.__name__: module}):
+                    if missing:
+                        with self.assertRaisesRegex(RuntimeError, "external-KV"):
+                            validate()
+                    else:
+                        validate()
+
+    def test_fa_only_uses_full_configured_store_capacity(self):
+        methods = _load_hma_methods(
+            {"_base_store_config", "_set_default_shm_buffer_capacity"}
+        )
+        methods["copy"] = copy
+        methods["KVConnectorRole"] = types.SimpleNamespace(WORKER="worker")
+        checked = []
+        methods["_check_shm_capacity"] = checked.append
+        for window_groups, expected in (([], 128), ([2], 64)):
+            with self.subTest(window_groups=window_groups):
+                connector = types.SimpleNamespace(
+                    connector_configs=[
+                        {
+                            "ucm_connector_name": "fake",
+                            "ucm_connector_config": {
+                                "posix_capacity_gb": 128,
+                                "cache_buffer_capacity_gb": 128,
+                            },
+                        }
+                    ],
+                    is_mla=True,
+                    unique_id="test",
+                    window_group_ids=window_groups,
+                    _role="worker",
+                    _vllm_config=types.SimpleNamespace(
+                        parallel_config=types.SimpleNamespace(data_parallel_rank=0)
+                    ),
+                    _namespace_storage_backends=lambda *_: None,
+                )
+                _, _, config = methods["_base_store_config"](connector, "fa")
+                self.assertEqual(config["posix_capacity_gb"], expected)
+                methods["_set_default_shm_buffer_capacity"](connector, config)
+                self.assertEqual(config["cache_buffer_capacity_gb"], expected)
+                self.assertEqual(checked[-1], 128)
+                self.assertEqual(
+                    connector.connector_configs[0]["ucm_connector_config"][
+                        "posix_capacity_gb"
+                    ],
+                    128,
+                )
+
     def test_ascend_v41_rejects_unsupported_replay_or_page_ownership(self):
         for change in (
             "replay",
@@ -282,6 +433,13 @@ class UCMV41CompatibilityTest(unittest.TestCase):
 
     def test_ascend_v41_registers_one_page_owner_and_roundtrips_scales(self):
         methods, connector = self._ascend_v41_connector()
+        self._assert_ascend_page_roundtrip(methods, connector, {0, 2})
+
+    def test_ascend_replay_registers_only_fa_and_roundtrips_scales(self):
+        methods, connector = self._ascend_v41_replay_connector()
+        self._assert_ascend_page_roundtrip(methods, connector, {0})
+
+    def _assert_ascend_page_roundtrip(self, methods, connector, expected_groups):
         methods["_init_group_metas"](connector)
         tree = ast.parse(HMA_PATH.read_text(encoding="utf-8"))
         layout_node = next(
@@ -340,7 +498,7 @@ class UCMV41CompatibilityTest(unittest.TestCase):
         for name, size in connector.whole_page_sizes.items():
             caches[name] = Tensor(size)
         register["register_kv_caches"](connector, caches)
-        self.assertEqual(set(connector.group_layouts), {0, 2})
+        self.assertEqual(set(connector.group_layouts), expected_groups)
         layout = connector.group_layouts[0]
         self.assertEqual(len(layout.base_ptrs), 2)
         self.assertEqual(layout.segment_tensor_size_list(128, 128), [262144] * 2)

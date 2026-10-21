@@ -198,3 +198,46 @@ curl http://localhost:7800/v1/completions \
 
 To run UCM with other models, first check which models are supported in the [Support Matrix](../user-guide/support-matrix/support_matrix.md). Then refer to the official [vLLM Recipes](https://recipes.vllm.ai/) and [vLLM-Ascend Model Tutorials](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/models/index.html) for the specific model's serving command and parameters. You only need to add the `--kv-transfer-config` argument as shown in the example above to enable UCM integration.
 </details>
+
+### DeepSeek V4.1: rebuild SWA instead of storing window snapshots
+
+On a vLLM/vLLM-Ascend build with SWA bounded replay support, add these flags
+to the model's serving command together with the UCM connector configuration:
+
+```bash
+--enable-prefix-caching --swa-bounded-replay
+```
+
+The Ascend worker and compiled attention operators must support replay slot
+padding and SWA visibility bounds. UCM checks for the external-KV replay
+protocol in vLLM; a local-prefix-only backport is insufficient. This path
+currently requires `PP=PCP=DCP=1`.
+
+UCM follows the resolved cache specs. SWA groups with
+`prefix_cacheable=False` and `prefix_replay_tokens=sliding_window` stay in
+the engine's local KV allocation, but are excluded from UCM registration,
+lookup, load and dump. When all SWA groups use replay, UCM creates only the
+FA store. The configured shared-buffer and POSIX capacities then belong
+entirely to FA instead of being split between FA and WA.
+
+For an accepted FA prefix hit of H tokens and a replay window of W tokens,
+UCM loads FA through H. The scheduler starts computation at H-W and the
+worker rebuilds SWA while protecting cached FA from being overwritten.
+UCM does not subtract W from the transfer boundary.
+
+Inspect the startup message:
+
+```text
+DeepSeek V4.1 UCM groups: excluded=[...], windows=[], replay_tokens=128
+```
+
+Here `128` is an example; it must match the model's replay window.
+`windows=[]` means no WA store is created. If startup instead reports
+`replay_tokens=0` and nonempty `windows`, replay was not enabled in the
+resolved specs and UCM continues to persist window snapshots. Use
+`--no-swa-bounded-replay` to select that behavior explicitly on builds
+supporting the flag.
+
+Existing `fawa_wa` files are not removed when switching modes. The request
+hash namespace includes the resolved replay policy, so replay and
+persistent-window cache records are separated.
